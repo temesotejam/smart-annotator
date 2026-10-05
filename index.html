@@ -71,10 +71,10 @@
 
       <section class="ai-panel">
         <div class="section-title">
-          <h2>AI補助（SAM ViT-B）</h2>
+          <h2>AI補助（SAM2 Hiera Tiny）</h2>
           <span id="aiBadge" class="ai-badge">未読込</span>
         </div>
-        <p id="aiStatus" class="ai-status">「AI選択」を押すと高精度SAMモデルを読み込みます。初回はモデル取得に時間がかかる場合があります。</p>
+        <p id="aiStatus" class="ai-status">「AI選択」を押すとSAM2モデルを読み込みます。初回はモデル取得に時間がかかる場合があります。</p>
         <div class="ai-help">
           <b>おすすめ：AI矩形</b>で対象を囲むと、その範囲をクロップして拡大解析します<br>
           AI点：左クリックで対象点 / 右クリックで除外点<br>
@@ -90,14 +90,14 @@
           <span>確定後、次の画像を自動追従</span>
         </label>
         <div id="followStatus" class="follow-status">追従OFF</div>
-        <p class="ai-note">AI矩形では対象周辺だけを切り出してSAM解析します。画像は外部サーバーへ送信せず、端末内で処理します。</p>
+        <p class="ai-note">AI矩形では対象周辺を切り出し、SAM2のbox promptで解析します。画像は外部サーバーへ送信せず、端末内で処理します。</p>
       </section>
     </aside>
   </main>
 
   <input id="projectInput" type="file" accept=".json,application/json" hidden>
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
   <script type="module" src="app.js"></script>
 </body>
 </html>
