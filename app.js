@@ -224,7 +224,7 @@ document.querySelectorAll(".tool").forEach(b=>b.onclick=async()=>{
   canvas.style.cursor=tool==="select"?"default":"crosshair";
   if(tool!=="ai"&&tool!=="aibox") clearAICandidate(false);
   draw();
-  if((tool==="ai"||tool==="aibox")&&current()) await prepareAIForCurrent();
+  if(tool==="ai"&&current()) await prepareAIForCurrent();
 });
 
 document.getElementById("addClassBtn").onclick=()=>{
@@ -368,52 +368,67 @@ async function prepareAIForCurrent(){
 async function handleAIBox(box){
   if(aiBusy)return;
   const im=current(); if(!im)return;
-  const ready=await prepareAIForCurrent(); if(!ready)return;
 
-  const cx=box.x+box.w/2, cy=box.y+box.h/2;
-  const normBox={
-    x1:box.x/im.width,
-    y1:box.y/im.height,
-    x2:(box.x+box.w)/im.width,
-    y2:(box.y+box.h)/im.height
+  const ok=await ensureAIModel(); if(!ok)return;
+
+  // Crop a padded ROI and run SAM on the crop instead of the whole frame.
+  // This makes small targets occupy much more of the model input.
+  const padX=Math.max(box.w*0.22,12);
+  const padY=Math.max(box.h*0.22,12);
+  const crop={
+    x:Math.max(0,box.x-padX),
+    y:Math.max(0,box.y-padY),
+    w:Math.min(im.width,box.x+box.w+padX)-Math.max(0,box.x-padX),
+    h:Math.min(im.height,box.y+box.h+padY)-Math.max(0,box.y-padY)
   };
 
-  // Positive seed in the object, plus automatic negative seeds near the
-  // inner border of the requested ROI. The lower edge gets extra negatives
-  // because thin supports/legs are a common false-positive in these frames.
-  const positives=[
-    {x:cx/im.width,y:cy/im.height,label:1},
-    {x:(box.x+box.w*0.42)/im.width,y:(box.y+box.h*0.45)/im.height,label:1},
-    {x:(box.x+box.w*0.58)/im.width,y:(box.y+box.h*0.45)/im.height,label:1}
-  ];
-  const negatives=[
-    {x:(box.x+box.w*0.05)/im.width,y:(box.y+box.h*0.20)/im.height,label:0},
-    {x:(box.x+box.w*0.95)/im.width,y:(box.y+box.h*0.20)/im.height,label:0},
-    {x:(box.x+box.w*0.05)/im.width,y:(box.y+box.h*0.75)/im.height,label:0},
-    {x:(box.x+box.w*0.95)/im.width,y:(box.y+box.h*0.75)/im.height,label:0},
-    {x:(box.x+box.w*0.22)/im.width,y:(box.y+box.h*0.94)/im.height,label:0},
-    {x:(box.x+box.w*0.50)/im.width,y:(box.y+box.h*0.94)/im.height,label:0},
-    {x:(box.x+box.w*0.78)/im.width,y:(box.y+box.h*0.94)/im.height,label:0}
-  ];
-  aiPoints=[...positives,...negatives].map(p=>({
-    x:Math.max(0,Math.min(1,p.x)),
-    y:Math.max(0,Math.min(1,p.y)),
-    label:p.label
-  }));
-  aiClearBtn.disabled=false;
-  draw();
+  const cropCanvas=document.createElement("canvas");
+  cropCanvas.width=Math.max(2,Math.round(crop.w));
+  cropCanvas.height=Math.max(2,Math.round(crop.h));
+  const cctx=cropCanvas.getContext("2d");
+  cctx.drawImage(im.img,crop.x,crop.y,crop.w,crop.h,0,0,cropCanvas.width,cropCanvas.height);
+
+  const cropUrl=cropCanvas.toDataURL("image/jpeg",0.96);
+  const cropId=im.id+":crop:"+[
+    Math.round(crop.x),Math.round(crop.y),Math.round(crop.w),Math.round(crop.h)
+  ].join(",");
 
   try{
     aiBusy=true;
-    setAIState("busy","SAMで候補生成 → GrabCutで境界を再分離しています…");
-    const result=await segment(aiPoints,normBox);
-    aiCandidate={...result,promptBox:normBox};
+    setAIState("busy","対象部分を切り出して高精度SAMで解析しています…");
+    await encodeImage(cropId,cropUrl,msg=>setAIState("busy",msg));
+    aiPreparedImageId=cropId;
+
+    const relBox={
+      x1:(box.x-crop.x)/crop.w,
+      y1:(box.y-crop.y)/crop.h,
+      x2:(box.x+box.w-crop.x)/crop.w,
+      y2:(box.y+box.h-crop.y)/crop.h
+    };
+    const cx=(relBox.x1+relBox.x2)/2;
+    const cy=(relBox.y1+relBox.y2)/2;
+    aiPoints=[{x:cx,y:cy,label:1}];
+    aiClearBtn.disabled=false;
+
+    const result=await segment(aiPoints,relBox,{refine:false,prune:false});
+
+    const mappedPolygon=result.polygon.map(p=>({
+      x:crop.x+(p.x/result.width)*crop.w,
+      y:crop.y+(p.y/result.height)*crop.h
+    }));
+
+    aiCandidate={
+      ...result,
+      polygon:mappedPolygon,
+      promptBox:null,
+      crop
+    };
     aiAcceptBtn.disabled=false;
-    setAIState("ready","矩形候補生成完了（score "+result.score.toFixed(2)+"）。Enterで確定、必要ならAI点で補正できます。");
+    setAIState("ready","クロップSAM候補生成完了（score "+result.score.toFixed(2)+"）。Enterで確定できます。");
     draw();
   }catch(err){
     console.error(err);
-    setAIState("error",err.message||"矩形による輪郭生成に失敗しました。");
+    setAIState("error",err.message||"クロップSAMによる輪郭生成に失敗しました。");
   }finally{
     aiBusy=false;
   }
@@ -440,7 +455,7 @@ async function handleAIPoint(e,p){
     aiBusy=true;
     setAIState("busy","輪郭を計算しています…");
     const promptBox=aiCandidate?.promptBox||null;
-    const result=await segment(aiPoints,promptBox);
+    const result=await segment(aiPoints,promptBox,{refine:false,prune:false});
     aiCandidate={...result,promptBox};
     aiAcceptBtn.disabled=false;
     setAIState("ready","候補生成完了（score "+result.score.toFixed(2)+"）。Enterまたは「AI確定」で採用できます。");
