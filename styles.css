@@ -54,8 +54,19 @@ h2{font-size:14px;margin:0}
 .class-name{flex:1;font-size:13px}
 .selection-panel{font-size:12px;line-height:1.7}
 .muted{color:var(--muted)}
-.ai-placeholder{padding:12px;border:1px dashed #3b4250;border-radius:10px}
-.ai-placeholder p{font-size:12px;color:var(--muted);line-height:1.5}
+.ai-panel{padding:12px;border:1px solid #384359;border-radius:10px;background:linear-gradient(180deg,#1a2030,#171a21)}
+.ai-status{font-size:12px;color:var(--text);line-height:1.5;margin:10px 0}
+.ai-help,.ai-note{font-size:11px;color:var(--muted);line-height:1.55}
+.ai-help{padding:8px;border-radius:7px;background:#11151d;margin-bottom:9px}
+.ai-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.ai-actions .btn{font-size:12px;padding:7px 8px}
+.ai-badge{font-size:10px;color:var(--muted);border:1px solid var(--line);padding:2px 6px;border-radius:999px}
+.ai-badge.ready{color:#7ce7b4;border-color:#2f8060}
+.ai-badge.busy{color:#ffd67a;border-color:#806b35}
+.ai-badge.error{color:#ff9ba5;border-color:#81424b}
+.tool.ai-tool{border-color:#4a5d8d}
+.tool.ai-tool.active{background:#7257d9;border-color:transparent}
+.ai-note{margin:10px 0 0}
 @media(max-width:900px){
   .layout{grid-template-columns:170px minmax(0,1fr)}
   .sidebar.right{display:none}
