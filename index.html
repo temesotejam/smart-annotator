@@ -33,6 +33,7 @@
         <button class="tool active" data-tool="box">矩形</button>
         <button class="tool" data-tool="polygon">ポリゴン</button>
         <button class="tool" data-tool="select">選択</button>
+        <button class="tool ai-tool" data-tool="ai">✨ AI選択</button>
         <span class="spacer"></span>
         <button id="undoBtn" class="btn small">Undo</button>
         <button id="deleteBtn" class="btn small danger">削除</button>
@@ -67,16 +68,29 @@
         <div id="selectionPanel" class="selection-panel muted">アノテーションを選択してください</div>
       </section>
 
-      <section class="ai-placeholder">
-        <h2>AI補助</h2>
-        <p>次の段階でSAM / WebGPUによる自動輪郭生成を追加します。</p>
-        <button class="btn" disabled>AIで選択（準備中）</button>
+      <section class="ai-panel">
+        <div class="section-title">
+          <h2>AI補助（SlimSAM）</h2>
+          <span id="aiBadge" class="ai-badge">未読込</span>
+        </div>
+        <p id="aiStatus" class="ai-status">「AI選択」を押すとモデルを読み込みます。</p>
+        <div class="ai-help">
+          左クリック：対象点を追加<br>
+          右クリック：除外点を追加<br>
+          Enter：候補を確定 / Esc：候補をクリア
+        </div>
+        <div class="ai-actions">
+          <button id="aiLoadBtn" class="btn">AIモデルを読み込む</button>
+          <button id="aiAcceptBtn" class="btn primary" disabled>AI確定</button>
+          <button id="aiClearBtn" class="btn" disabled>クリア</button>
+        </div>
+        <p class="ai-note">画像は外部サーバーへ送信せず、対応ブラウザではWebGPUで端末内推論します。</p>
       </section>
     </aside>
   </main>
 
   <input id="projectInput" type="file" accept=".json,application/json" hidden>
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-  <script src="app.js"></script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>
