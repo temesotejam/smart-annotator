@@ -101,13 +101,13 @@ function draw(){
   ctx.drawImage(im.img,t.ox,t.oy,im.width*t.s,im.height*t.s);
   for(const a of im.annotations)drawAnnotation(a,a.id===selectedId);
   if(drawing){
-    if(drawing.type==="box")drawBox(drawing,true);
+    if(drawing.type==="box"||drawing.type==="aibox")drawBox(drawing,true);
     else if(drawing.type==="polygon")drawPolygon(drawing,true);
   }
   if(aiCandidate?.polygon?.length){
     drawPolygon({type:"polygon",classId:activeClassId,points:aiCandidate.polygon,preview:false},true);
   }
-  if(tool==="ai"&&aiPoints.length){
+  if((tool==="ai"||tool==="aibox")&&aiPoints.length){
     for(const q of aiPoints){
       const p=imageToCanvas({x:q.x*im.width,y:q.y*im.height});
       ctx.beginPath();ctx.arc(p.x,p.y,7,0,Math.PI*2);
@@ -153,6 +153,8 @@ canvas.addEventListener("pointerdown",e=>{
   const p=eventPoint(e); if(!insideImage(p))return;
   if(tool==="box"){
     pushHistory(); drawing={id:uid(),type:"box",classId:activeClassId,x:p.x,y:p.y,w:0,h:0}; canvas.setPointerCapture(e.pointerId);
+  }else if(tool==="aibox"){
+    drawing={id:uid(),type:"aibox",classId:activeClassId,x:p.x,y:p.y,w:0,h:0}; canvas.setPointerCapture(e.pointerId);
   }else if(tool==="polygon"){
     if(!drawing){pushHistory();drawing={id:uid(),type:"polygon",classId:activeClassId,points:[p],preview:true}}
     else drawing.points.push(p);
@@ -164,23 +166,27 @@ canvas.addEventListener("pointerdown",e=>{
   }
 });
 canvas.addEventListener("pointermove",e=>{
-  if(!drawing||drawing.type!=="box")return;
+  if(!drawing||(drawing.type!=="box"&&drawing.type!=="aibox"))return;
   const p=eventPoint(e);
   drawing.w=p.x-drawing.x;drawing.h=p.y-drawing.y;draw();
 });
-canvas.addEventListener("pointerup",e=>{
-  if(!drawing||drawing.type!=="box")return;
+canvas.addEventListener("pointerup",async e=>{
+  if(!drawing||(drawing.type!=="box"&&drawing.type!=="aibox"))return;
   let a=drawing;drawing=null;
   if(a.w<0){a.x+=a.w;a.w=-a.w} if(a.h<0){a.y+=a.h;a.h=-a.h}
-  if(a.w>2&&a.h>2){current().annotations.push(a);selectedId=a.id}
-  renderAll();
+  if(a.w<=2||a.h<=2){draw();return}
+  if(a.type==="box"){
+    current().annotations.push(a);selectedId=a.id;renderAll();
+  }else{
+    await handleAIBox(a);
+  }
 });
-canvas.addEventListener("contextmenu",e=>{if(tool==="ai")e.preventDefault()});
+canvas.addEventListener("contextmenu",e=>{if(tool==="ai"||tool==="aibox")e.preventDefault()});
 
 window.addEventListener("keydown",e=>{
-  if(e.key==="Enter"&&tool==="ai"&&aiCandidate){
+  if(e.key==="Enter"&&(tool==="ai"||tool==="aibox")&&aiCandidate){
     e.preventDefault();acceptAICandidate();
-  }else if(e.key==="Escape"&&tool==="ai"&&(aiCandidate||aiPoints.length)){
+  }else if(e.key==="Escape"&&(tool==="ai"||tool==="aibox")&&(aiCandidate||aiPoints.length)){
     e.preventDefault();clearAICandidate();
   }else if(e.key==="Enter"&&drawing?.type==="polygon"){
     if(drawing.points.length>=3){drawing.preview=false;current().annotations.push(drawing);selectedId=drawing.id}
@@ -216,9 +222,9 @@ document.querySelectorAll(".tool").forEach(b=>b.onclick=async()=>{
   tool=b.dataset.tool;drawing=null;
   document.querySelectorAll(".tool").forEach(x=>x.classList.toggle("active",x===b));
   canvas.style.cursor=tool==="select"?"default":"crosshair";
-  if(tool!=="ai") clearAICandidate(false);
+  if(tool!=="ai"&&tool!=="aibox") clearAICandidate(false);
   draw();
-  if(tool==="ai"&&current()) await prepareAIForCurrent();
+  if((tool==="ai"||tool==="aibox")&&current()) await prepareAIForCurrent();
 });
 
 document.getElementById("addClassBtn").onclick=()=>{
@@ -353,6 +359,40 @@ async function prepareAIForCurrent(){
     console.error(err);
     setAIState("error",err.message||"画像のAI解析に失敗しました。");
     return false;
+  }finally{
+    aiBusy=false;
+  }
+}
+
+
+async function handleAIBox(box){
+  if(aiBusy)return;
+  const im=current(); if(!im)return;
+  const ready=await prepareAIForCurrent(); if(!ready)return;
+
+  const cx=box.x+box.w/2, cy=box.y+box.h/2;
+  aiPoints=[{x:cx/im.width,y:cy/im.height,label:1}];
+  aiClearBtn.disabled=false;
+  draw();
+
+  const normBox={
+    x1:box.x/im.width,
+    y1:box.y/im.height,
+    x2:(box.x+box.w)/im.width,
+    y2:(box.y+box.h)/im.height
+  };
+
+  try{
+    aiBusy=true;
+    setAIState("busy","矩形範囲から高精度輪郭を計算しています…");
+    const result=await segment(aiPoints,normBox);
+    aiCandidate={...result,promptBox:normBox};
+    aiAcceptBtn.disabled=false;
+    setAIState("ready","矩形候補生成完了（score "+result.score.toFixed(2)+"）。Enterで確定、必要ならAI点で補正できます。");
+    draw();
+  }catch(err){
+    console.error(err);
+    setAIState("error",err.message||"矩形による輪郭生成に失敗しました。");
   }finally{
     aiBusy=false;
   }
