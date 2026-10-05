@@ -125,16 +125,25 @@ export async function segment(points, box = null) {
     if (quality > bestQuality) { bestQuality = quality; best = m; }
   }
 
-  const binary = new Uint8Array(rawMask.width * rawMask.height);
+  let binary = new Uint8Array(rawMask.width * rawMask.height);
   for (let i = 0; i < binary.length; i++) {
     binary[i] = rawMask.data[nMasks * i + best] === 1 ? 1 : 0;
   }
 
   const positive = points.find((p) => p.label === 1) || points[0];
   const anchor = {
-    x: positive.x * rawMask.width,
-    y: positive.y * rawMask.height,
+    x: Math.max(0, Math.min(rawMask.width - 1, Math.round(positive.x * (rawMask.width - 1)))),
+    y: Math.max(0, Math.min(rawMask.height - 1, Math.round(positive.y * (rawMask.height - 1)))),
   };
+
+  // Clean the mask before vectorizing it:
+  // 1) keep only the connected object nearest/containing the positive prompt,
+  // 2) remove isolated noise,
+  // 3) close tiny 1px gaps without noticeably changing the silhouette.
+  binary = selectPromptComponent(binary, rawMask.width, rawMask.height, anchor);
+  binary = removeTinyIslands(binary, rawMask.width, rawMask.height, Math.max(12, Math.floor(rawMask.width * rawMask.height * 0.00001)));
+  binary = morphClose3(binary, rawMask.width, rawMask.height);
+
   const polygon = maskToPolygon(binary, rawMask.width, rawMask.height, anchor);
   if (polygon.length < 3) throw new Error("輪郭を取り出せませんでした。別の点をクリックしてください。");
 
@@ -144,6 +153,100 @@ export async function segment(points, box = null) {
     score: scores[best],
     polygon,
   };
+}
+
+
+function selectPromptComponent(binary, width, height, anchor) {
+  const total = width * height;
+  const visited = new Uint8Array(total);
+  const components = [];
+  const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]];
+
+  for (let idx = 0; idx < total; idx++) {
+    if (!binary[idx] || visited[idx]) continue;
+    const stack = [idx];
+    visited[idx] = 1;
+    const pixels = [];
+    let containsAnchor = false;
+    let minAnchorD2 = Infinity;
+
+    while (stack.length) {
+      const cur = stack.pop();
+      pixels.push(cur);
+      const x = cur % width, y = (cur / width) | 0;
+      const d2 = (x - anchor.x) ** 2 + (y - anchor.y) ** 2;
+      if (d2 < minAnchorD2) minAnchorD2 = d2;
+      if (x === anchor.x && y === anchor.y) containsAnchor = true;
+
+      for (const [dx,dy] of dirs) {
+        const nx=x+dx, ny=y+dy;
+        if (nx<0||ny<0||nx>=width||ny>=height) continue;
+        const ni=ny*width+nx;
+        if (binary[ni]&&!visited[ni]) { visited[ni]=1; stack.push(ni); }
+      }
+    }
+    components.push({pixels,containsAnchor,minAnchorD2});
+  }
+
+  if (!components.length) return binary;
+  let chosen = components.find(c => c.containsAnchor);
+  if (!chosen) {
+    chosen = components.sort((a,b) => {
+      if (Math.abs(a.minAnchorD2-b.minAnchorD2)>1) return a.minAnchorD2-b.minAnchorD2;
+      return b.pixels.length-a.pixels.length;
+    })[0];
+  }
+
+  const out = new Uint8Array(total);
+  for (const i of chosen.pixels) out[i]=1;
+  return out;
+}
+
+function removeTinyIslands(binary, width, height, minSize) {
+  // selectPromptComponent usually leaves one component; this also cleans
+  // artifacts that may reappear after later morphology.
+  const total=width*height, visited=new Uint8Array(total), out=new Uint8Array(total);
+  const dirs=[[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]];
+  for(let idx=0;idx<total;idx++){
+    if(!binary[idx]||visited[idx])continue;
+    const stack=[idx], pixels=[];visited[idx]=1;
+    while(stack.length){
+      const cur=stack.pop();pixels.push(cur);
+      const x=cur%width,y=(cur/width)|0;
+      for(const [dx,dy] of dirs){
+        const nx=x+dx,ny=y+dy;
+        if(nx<0||ny<0||nx>=width||ny>=height)continue;
+        const ni=ny*width+nx;
+        if(binary[ni]&&!visited[ni]){visited[ni]=1;stack.push(ni)}
+      }
+    }
+    if(pixels.length>=minSize)for(const p of pixels)out[p]=1;
+  }
+  return out;
+}
+
+function morphClose3(src, width, height) {
+  const dilated=new Uint8Array(src.length);
+  for(let y=1;y<height-1;y++){
+    for(let x=1;x<width-1;x++){
+      let on=0;
+      for(let dy=-1;dy<=1&&!on;dy++)for(let dx=-1;dx<=1;dx++){
+        if(src[(y+dy)*width+(x+dx)]){on=1;break}
+      }
+      dilated[y*width+x]=on;
+    }
+  }
+  const eroded=new Uint8Array(src.length);
+  for(let y=1;y<height-1;y++){
+    for(let x=1;x<width-1;x++){
+      let on=1;
+      for(let dy=-1;dy<=1&&on;dy++)for(let dx=-1;dx<=1;dx++){
+        if(!dilated[(y+dy)*width+(x+dx)]){on=0;break}
+      }
+      eroded[y*width+x]=on;
+    }
+  }
+  return eroded;
 }
 
 function maskToPolygon(binary, width, height, anchor = null) {
@@ -175,12 +278,14 @@ function maskToPolygon(binary, width, height, anchor = null) {
   let points = chosen.ring.slice(0, -1).map(([x, y]) => ({ x, y }));
 
   // Keep substantially more contour detail than before.
-  const epsilon = Math.max(0.7, Math.min(width, height) * 0.001);
+  // Preserve substantially more boundary detail. This is intentionally much
+  // less aggressive than the previous simplification.
+  const epsilon = Math.max(0.25, Math.min(width, height) * 0.00035);
   points = simplifyClosed(points, epsilon);
 
-  // High-detail cap: enough for accurate boundaries while keeping JSON manageable.
-  if (points.length > 700) {
-    const step = Math.ceil(points.length / 700);
+  // Allow dense contours for research/annotation use.
+  if (points.length > 1600) {
+    const step = Math.ceil(points.length / 1600);
     points = points.filter((_, i) => i % step === 0);
   }
   return points;
