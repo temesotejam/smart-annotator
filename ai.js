@@ -160,9 +160,17 @@ export async function segment(points, box = null) {
         encodedRawImage,
       );
       binary = selectPromptComponent(binary, rawMask.width, rawMask.height, anchor);
+
+      // Remove thin bridges/appendages (e.g. chair legs or supports) while
+      // preserving the main object boundary as much as possible.
+      binary = pruneThinAttachments(binary, rawMask.width, rawMask.height, anchor, box);
     } catch (err) {
       console.warn("GrabCut refinement skipped:", err);
     }
+  }
+
+  if (box) {
+    binary = pruneThinAttachments(binary, rawMask.width, rawMask.height, anchor, box);
   }
 
   const polygon = maskToPolygon(binary, rawMask.width, rawMask.height, anchor);
@@ -177,6 +185,75 @@ export async function segment(points, box = null) {
 }
 
 
+
+
+function pruneThinAttachments(binary, width, height, anchor, box) {
+  // Estimate a conservative radius from the prompted ROI size.
+  const roiW = box ? Math.max(1, (box.x2 - box.x1) * width) : width * 0.15;
+  const roiH = box ? Math.max(1, (box.y2 - box.y1) * height) : height * 0.15;
+  const radius = Math.max(1, Math.min(4, Math.round(Math.min(roiW, roiH) * 0.018)));
+
+  if (radius <= 0) return binary;
+
+  const original = binary;
+  let core = binary;
+
+  // Erode just enough to break narrow bridges.
+  for (let r = 0; r < radius; r++) core = erode8(core, width, height);
+
+  // Keep the eroded core nearest to the positive prompt.
+  core = selectPromptComponent(core, width, height, anchor);
+
+  // Restore roughly the original thickness.
+  let restored = core;
+  for (let r = 0; r < radius; r++) restored = dilate8(restored, width, height);
+
+  // Geodesic-like reconstruction: never grow outside the original SAM/GrabCut mask.
+  const out = new Uint8Array(original.length);
+  for (let i = 0; i < out.length; i++) out[i] = restored[i] && original[i] ? 1 : 0;
+
+  // If pruning was too aggressive, safely fall back.
+  let before = 0, after = 0;
+  for (let i = 0; i < out.length; i++) {
+    if (original[i]) before++;
+    if (out[i]) after++;
+  }
+  if (!after || (before && after / before < 0.42)) return original;
+
+  return out;
+}
+
+function erode8(src, width, height) {
+  const out = new Uint8Array(src.length);
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      let keep = 1;
+      for (let dy = -1; dy <= 1 && keep; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (!src[(y + dy) * width + (x + dx)]) { keep = 0; break; }
+        }
+      }
+      out[y * width + x] = keep;
+    }
+  }
+  return out;
+}
+
+function dilate8(src, width, height) {
+  const out = new Uint8Array(src.length);
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      let on = 0;
+      for (let dy = -1; dy <= 1 && !on; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (src[(y + dy) * width + (x + dx)]) { on = 1; break; }
+        }
+      }
+      out[y * width + x] = on;
+    }
+  }
+  return out;
+}
 
 async function waitForOpenCV(timeoutMs = 12000) {
   const start = performance.now();
