@@ -53,7 +53,7 @@ export function clearEncodedImage() {
   encodedRawImage = null;
 }
 
-export async function segment(points, box = null) {
+export async function segment(points, box = null, options = {}) {
   if (!imageEmbeddings || !imageProcessed) {
     throw new Error("画像のAI解析がまだ完了していません。");
   }
@@ -139,17 +139,13 @@ export async function segment(points, box = null) {
     y: Math.max(0, Math.min(rawMask.height - 1, Math.round(positive.y * (rawMask.height - 1)))),
   };
 
-  // Clean the mask before vectorizing it:
-  // 1) keep only the connected object nearest/containing the positive prompt,
-  // 2) remove isolated noise,
-  // 3) close tiny 1px gaps without noticeably changing the silhouette.
+  // Conservative cleanup only: keep the component linked to the positive prompt.
   binary = selectPromptComponent(binary, rawMask.width, rawMask.height, anchor);
-  binary = removeTinyIslands(binary, rawMask.width, rawMask.height, Math.max(12, Math.floor(rawMask.width * rawMask.height * 0.00001)));
-  binary = morphClose3(binary, rawMask.width, rawMask.height);
+  binary = removeTinyIslands(binary, rawMask.width, rawMask.height, Math.max(8, Math.floor(rawMask.width * rawMask.height * 0.000005)));
 
-  // Refine SAM's coarse mask against the actual image colors/edges.
-  // If OpenCV.js has not finished loading, keep the SAM result as a fallback.
-  if (box && encodedRawImage) {
+  // Optional legacy refinement. ROI-crop mode intentionally skips this because
+  // it was too aggressive on small targets.
+  if (options.refine !== false && box && encodedRawImage) {
     try {
       binary = await refineWithGrabCut(
         binary,
@@ -169,7 +165,7 @@ export async function segment(points, box = null) {
     }
   }
 
-  if (box) {
+  if (options.prune !== false && box) {
     binary = pruneThinAttachments(binary, rawMask.width, rawMask.height, anchor, box);
   }
 
