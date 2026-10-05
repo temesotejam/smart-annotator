@@ -84,6 +84,11 @@
           <button id="aiAcceptBtn" class="btn primary" disabled>AI確定</button>
           <button id="aiClearBtn" class="btn" disabled>クリア</button>
         </div>
+        <label class="follow-toggle">
+          <input id="autoFollowToggle" type="checkbox">
+          <span>確定後、次の画像を自動追従</span>
+        </label>
+        <div id="followStatus" class="follow-status">追従OFF</div>
         <p class="ai-note">画像は外部サーバーへ送信せず、対応ブラウザではWebGPUで端末内推論します。</p>
       </section>
     </aside>
