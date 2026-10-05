@@ -17,6 +17,8 @@ const aiBadge=document.getElementById("aiBadge");
 const aiLoadBtn=document.getElementById("aiLoadBtn");
 const aiAcceptBtn=document.getElementById("aiAcceptBtn");
 const aiClearBtn=document.getElementById("aiClearBtn");
+const autoFollowToggle=document.getElementById("autoFollowToggle");
+const followStatus=document.getElementById("followStatus");
 
 const palette=["#5b8cff","#ff7a59","#32c48d","#f3c84b","#b47cff","#31c6d4","#ff5d92","#9bc53d"];
 let images=[];
@@ -56,7 +58,9 @@ function resizeCanvas(){
 new ResizeObserver(resizeCanvas).observe(stageWrap);
 
 async function addFiles(files){
-  const accepted=[...files].filter(f=>f.type.startsWith("image/"));
+  const accepted=[...files]
+    .filter(f=>f.type.startsWith("image/"))
+    .sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:"base"}));
   for(const file of accepted){
     const url=URL.createObjectURL(file);
     const img=new Image();
@@ -387,8 +391,10 @@ async function handleAIPoint(e,p){
   }
 }
 
-function acceptAICandidate(){
-  if(!aiCandidate?.polygon?.length||!current())return;
+async function acceptAICandidate(){
+  const im=current();
+  if(!aiCandidate?.polygon?.length||!im)return;
+
   pushHistory();
   const a={
     id:uid(),
@@ -398,12 +404,121 @@ function acceptAICandidate(){
     preview:false,
     source:"ai"
   };
-  current().annotations.push(a);
+  const followSeeds=buildFollowSeeds(a.points,im);
+  const followClassId=a.classId;
+
+  im.annotations.push(a);
   selectedId=a.id;
   clearAICandidate(false);
   renderAll();
-  setAIState("ready","AI輪郭を追加しました。次の対象をクリックできます。");
+
+  if(autoFollowToggle.checked && currentIndex < images.length-1){
+    setAIState("ready","AI輪郭を追加しました。次フレームを自動追従します。");
+    await followToNextImage(followSeeds,followClassId);
+  }else{
+    if(autoFollowToggle.checked && currentIndex>=images.length-1){
+      followStatus.className="follow-status on";
+      followStatus.textContent="最後の画像まで到達しました";
+    }
+    setAIState("ready","AI輪郭を追加しました。次の対象をクリックできます。");
+  }
 }
+
+
+function buildFollowSeeds(points,im){
+  if(!points?.length||!im)return [];
+  const xs=points.map(p=>p.x), ys=points.map(p=>p.y);
+  const minX=Math.min(...xs), maxX=Math.max(...xs);
+  const minY=Math.min(...ys), maxY=Math.max(...ys);
+  const bw=Math.max(1,maxX-minX), bh=Math.max(1,maxY-minY);
+
+  let center={x:(minX+maxX)/2,y:(minY+maxY)/2};
+  if(!pointInPolygon(center,points)){
+    let best=null,bestD=Infinity;
+    for(let gy=1;gy<=7;gy++){
+      for(let gx=1;gx<=7;gx++){
+        const p={x:minX+bw*gx/8,y:minY+bh*gy/8};
+        if(!pointInPolygon(p,points))continue;
+        const d=(p.x-center.x)**2+(p.y-center.y)**2;
+        if(d<bestD){best=p;bestD=d}
+      }
+    }
+    if(best)center=best;
+  }
+
+  const probes=[
+    center,
+    {x:center.x-bw*0.12,y:center.y},
+    {x:center.x+bw*0.12,y:center.y},
+    {x:center.x,y:center.y-bh*0.12},
+    {x:center.x,y:center.y+bh*0.12}
+  ];
+  const seeds=[];
+  for(const p of probes){
+    if(p.x<0||p.y<0||p.x>im.width||p.y>im.height)continue;
+    if(!pointInPolygon(p,points))continue;
+    const q={x:p.x/im.width,y:p.y/im.height,label:1};
+    if(!seeds.some(s=>Math.hypot(s.x-q.x,s.y-q.y)<0.008))seeds.push(q);
+  }
+
+  if(!seeds.length){
+    const p=points[Math.floor(points.length/2)];
+    seeds.push({x:p.x/im.width,y:p.y/im.height,label:1});
+  }
+  return seeds.slice(0,5);
+}
+
+async function followToNextImage(seeds,classId){
+  if(!seeds?.length || currentIndex>=images.length-1)return;
+  followStatus.className="follow-status busy";
+  followStatus.textContent="次の画像を追従中…";
+
+  currentIndex++;
+  activeClassId=classId;
+  selectedId=null;
+  drawing=null;
+  clearAICandidate(false);
+  aiPreparedImageId=null;
+  clearEncodedImage();
+  renderAll();
+
+  const ready=await prepareAIForCurrent();
+  if(!ready){
+    followStatus.className="follow-status";
+    followStatus.textContent="追従失敗：AI準備エラー";
+    return;
+  }
+
+  aiPoints=seeds.map(p=>({...p}));
+  aiClearBtn.disabled=false;
+  draw();
+
+  try{
+    aiBusy=true;
+    setAIState("busy","前フレームから追従候補を計算しています…");
+    const result=await segment(aiPoints);
+    aiCandidate=result;
+    aiAcceptBtn.disabled=false;
+    followStatus.className="follow-status on";
+    followStatus.textContent="追従候補あり：Enterで確定、クリックで補正";
+    setAIState("ready","追従候補生成完了（score "+result.score.toFixed(2)+"）。Enterで確定、ずれていればクリックで補正してください。");
+    draw();
+  }catch(err){
+    console.error(err);
+    followStatus.className="follow-status";
+    followStatus.textContent="追従候補の生成に失敗";
+    setAIState("error",err.message||"自動追従に失敗しました。");
+  }finally{
+    aiBusy=false;
+  }
+}
+
+autoFollowToggle.addEventListener("change",()=>{
+  followStatus.className="follow-status"+(autoFollowToggle.checked?" on":"");
+  followStatus.textContent=autoFollowToggle.checked
+    ?"追従ON：AI確定すると次画像へ進みます"
+    :"追従OFF";
+});
 
 function clearAICandidate(redraw=true){
   aiPoints=[];
@@ -417,7 +532,7 @@ aiLoadBtn.onclick=async()=>{
   await ensureAIModel();
   if(current())await prepareAIForCurrent();
 };
-aiAcceptBtn.onclick=acceptAICandidate;
+aiAcceptBtn.onclick=()=>acceptAICandidate();
 aiClearBtn.onclick=()=>{
   clearAICandidate();
   setAIState(isModelLoaded()?"ready":"","候補をクリアしました。");
