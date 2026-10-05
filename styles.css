@@ -78,3 +78,5 @@ h2{font-size:14px;margin:0}
 .follow-status{margin-top:7px;font-size:11px;color:var(--muted)}
 .follow-status.on{color:#7ce7b4}
 .follow-status.busy{color:#ffd67a}
+
+.tool[data-tool="aibox"].active{background:#7257d9;border-color:transparent}
