@@ -1,3 +1,5 @@
+import { loadAI, encodeImage, segment, isModelLoaded, clearEncodedImage } from "./ai.js";
+
 "use strict";
 
 const fileInput=document.getElementById("fileInput");
@@ -10,6 +12,11 @@ const classList=document.getElementById("classList");
 const imageStatus=document.getElementById("imageStatus");
 const annotationStatus=document.getElementById("annotationStatus");
 const selectionPanel=document.getElementById("selectionPanel");
+const aiStatus=document.getElementById("aiStatus");
+const aiBadge=document.getElementById("aiBadge");
+const aiLoadBtn=document.getElementById("aiLoadBtn");
+const aiAcceptBtn=document.getElementById("aiAcceptBtn");
+const aiClearBtn=document.getElementById("aiClearBtn");
 
 const palette=["#5b8cff","#ff7a59","#32c48d","#f3c84b","#b47cff","#31c6d4","#ff5d92","#9bc53d"];
 let images=[];
@@ -20,6 +27,10 @@ let tool="box";
 let selectedId=null;
 let drawing=null;
 let history=[];
+let aiPoints=[];
+let aiCandidate=null;
+let aiBusy=false;
+let aiPreparedImageId=null;
 
 function uid(){return crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.random()}
 function current(){return images[currentIndex]||null}
@@ -32,7 +43,78 @@ function restoreHistory(){
   const s=history.pop(); if(!s)return;
   const snapshot=JSON.parse(s);
   for(const item of snapshot){const im=images.find(x=>x.id===item.id);if(im)im.annotations=item.annotations}
-  selectedId=null; renderAll();
+  selectedId=null; async function setAIState(kind,message){
+  aiBadge.className="ai-badge"+(kind?" "+kind:"");
+  aiBadge.textContent=kind==="ready"?"準備完了":kind==="busy"?"処理中":kind==="error"?"エラー":"未読込";
+  if(message)aiStatus.textContent=message;
+}
+
+async function ensureAIModel(){
+  if(isModelLoaded()){setAIState("ready","AIモデル準備完了");return true}
+  try{
+    aiBusy=true;setAIState("busy","AIモデルを読み込んでいます…");aiLoadBtn.disabled=true;
+    await loadAI(msg=>setAIState("busy",msg));
+    setAIState("ready","AIモデル準備完了。画像を解析します。");
+    return true;
+  }catch(err){
+    console.error(err);setAIState("error",err.message||"AIモデルの読み込みに失敗しました。");return false;
+  }finally{aiBusy=false;aiLoadBtn.disabled=false}
+}
+
+async function prepareAIForCurrent(){
+  const im=current();if(!im||aiBusy)return false;
+  if(aiPreparedImageId===im.id){setAIState("ready","対象を左クリックしてください。右クリックで除外点を追加できます。");return true}
+  const ok=await ensureAIModel();if(!ok)return false;
+  try{
+    aiBusy=true;setAIState("busy","この画像をAI用に解析しています…");
+    await encodeImage(im.id,im.url,msg=>setAIState("busy",msg));
+    aiPreparedImageId=im.id;
+    setAIState("ready","対象を左クリックしてください。右クリックで除外点を追加できます。");
+    return true;
+  }catch(err){
+    console.error(err);setAIState("error",err.message||"画像のAI解析に失敗しました。");return false;
+  }finally{aiBusy=false}
+}
+
+async function handleAIPoint(e,p){
+  if(aiBusy)return;
+  const im=current();if(!im)return;
+  const ready=await prepareAIForCurrent();if(!ready)return;
+  const label=e.button===2?0:1;
+  if(e.button!==0&&e.button!==2)return;
+  aiPoints.push({x:p.x/im.width,y:p.y/im.height,label});
+  aiClearBtn.disabled=false;draw();
+  try{
+    aiBusy=true;setAIState("busy","輪郭を計算しています…");
+    const result=await segment(aiPoints);
+    aiCandidate=result;
+    aiAcceptBtn.disabled=false;
+    setAIState("ready","候補生成完了（score "+result.score.toFixed(2)+"）。Enterまたは「AI確定」で採用できます。");
+    draw();
+  }catch(err){
+    console.error(err);setAIState("error",err.message||"輪郭生成に失敗しました。");
+  }finally{aiBusy=false}
+}
+
+function acceptAICandidate(){
+  if(!aiCandidate?.polygon?.length||!current())return;
+  pushHistory();
+  const a={id:uid(),type:"polygon",classId:activeClassId,points:aiCandidate.polygon.map(p=>({x:p.x,y:p.y})),preview:false,source:"ai"};
+  current().annotations.push(a);selectedId=a.id;
+  clearAICandidate(false);renderAll();
+  setAIState("ready","AI輪郭を追加しました。次の対象をクリックできます。");
+}
+
+function clearAICandidate(redraw=true){
+  aiPoints=[];aiCandidate=null;aiAcceptBtn.disabled=true;aiClearBtn.disabled=true;
+  if(redraw)draw();
+}
+
+aiLoadBtn.onclick=async()=>{await ensureAIModel();if(current())await prepareAIForCurrent()};
+aiAcceptBtn.onclick=acceptAICandidate;
+aiClearBtn.onclick=()=>{clearAICandidate();setAIState(isModelLoaded()?"ready":"","候補をクリアしました。")};
+
+renderAll();
 }
 function resizeCanvas(){
   const r=stageWrap.getBoundingClientRect();
@@ -89,6 +171,20 @@ function draw(){
     if(drawing.type==="box")drawBox(drawing,true);
     else if(drawing.type==="polygon")drawPolygon(drawing,true);
   }
+  if(aiCandidate?.polygon?.length){
+    drawPolygon({type:"polygon",classId:activeClassId,points:aiCandidate.polygon,preview:false},true);
+  }
+  if(tool==="ai"&&aiPoints.length){
+    for(const q of aiPoints){
+      const p=imageToCanvas({x:q.x*im.width,y:q.y*im.height});
+      ctx.beginPath();ctx.arc(p.x,p.y,7,0,Math.PI*2);
+      ctx.fillStyle=q.label===1?"#52e39a":"#ff6675";ctx.fill();
+      ctx.lineWidth=2;ctx.strokeStyle="#ffffff";ctx.stroke();
+      ctx.beginPath();ctx.moveTo(p.x-4,p.y);ctx.lineTo(p.x+4,p.y);
+      if(q.label===1){ctx.moveTo(p.x,p.y-4);ctx.lineTo(p.x,p.y+4)}
+      ctx.strokeStyle="#ffffff";ctx.lineWidth=1.5;ctx.stroke();
+    }
+  }
 }
 function drawAnnotation(a,selected){
   if(a.type==="box")drawBox(a,selected); else drawPolygon(a,selected);
@@ -130,6 +226,8 @@ canvas.addEventListener("pointerdown",e=>{
     draw();
   }else if(tool==="select"){
     selectedId=hitTest(p); updateSelection(); draw();
+  }else if(tool==="ai"){
+    handleAIPoint(e,p);
   }
 });
 canvas.addEventListener("pointermove",e=>{
@@ -144,8 +242,14 @@ canvas.addEventListener("pointerup",e=>{
   if(a.w>2&&a.h>2){current().annotations.push(a);selectedId=a.id}
   renderAll();
 });
+canvas.addEventListener("contextmenu",e=>{if(tool==="ai")e.preventDefault()});
+
 window.addEventListener("keydown",e=>{
-  if(e.key==="Enter"&&drawing?.type==="polygon"){
+  if(e.key==="Enter"&&tool==="ai"&&aiCandidate){
+    e.preventDefault();acceptAICandidate();
+  }else if(e.key==="Escape"&&tool==="ai"&&(aiCandidate||aiPoints.length)){
+    e.preventDefault();clearAICandidate();
+  }else if(e.key==="Enter"&&drawing?.type==="polygon"){
     if(drawing.points.length>=3){drawing.preview=false;current().annotations.push(drawing);selectedId=drawing.id}
     drawing=null;renderAll();
   }else if(e.key==="Escape"&&drawing){drawing=null;renderAll()}
@@ -175,10 +279,13 @@ function deleteSelected(){
 document.getElementById("deleteBtn").onclick=deleteSelected;
 document.getElementById("undoBtn").onclick=restoreHistory;
 
-document.querySelectorAll(".tool").forEach(b=>b.onclick=()=>{
+document.querySelectorAll(".tool").forEach(b=>b.onclick=async()=>{
   tool=b.dataset.tool;drawing=null;
   document.querySelectorAll(".tool").forEach(x=>x.classList.toggle("active",x===b));
-  canvas.style.cursor=tool==="select"?"default":"crosshair";draw();
+  canvas.style.cursor=tool==="select"?"default":"crosshair";
+  if(tool!=="ai") clearAICandidate(false);
+  draw();
+  if(tool==="ai"&&current()) await prepareAIForCurrent();
 });
 
 document.getElementById("addClassBtn").onclick=()=>{
@@ -205,7 +312,7 @@ function renderImages(){
     el.innerHTML='<img class="thumb"><div class="image-meta"><div class="image-name"></div><div class="image-count"></div></div>';
     el.querySelector("img").src=im.url;el.querySelector(".image-name").textContent=im.name;
     el.querySelector(".image-count").textContent=im.annotations.length+" annotations";
-    el.onclick=()=>{currentIndex=i;selectedId=null;drawing=null;renderAll()};
+    el.onclick=()=>{currentIndex=i;selectedId=null;drawing=null;clearAICandidate(false);aiPreparedImageId=null;clearEncodedImage();renderAll();if(tool==="ai")prepareAIForCurrent()};
     imageList.appendChild(el);
   });
 }
