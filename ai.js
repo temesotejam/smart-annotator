@@ -9,6 +9,7 @@ let encoderSession = null;
 let decoderSession = null;
 let imageEmbedding = null;
 let encodedImageId = null;
+let encodedEdgeMap = null;
 
 export function isModelLoaded() {
   return !!encoderSession && !!decoderSession;
@@ -39,8 +40,9 @@ export async function encodeImage(imageId, url, onStatus = () => {}) {
 
   onStatus("SAM2で画像特徴を抽出しています…");
   const img = await loadImage(url);
-  const tensor = imageToTensor(img);
-  const results = await encoderSession.run({ image: tensor });
+  const prepared = imageToTensorAndEdges(img);
+  encodedEdgeMap = prepared.edgeMap;
+  const results = await encoderSession.run({ image: prepared.tensor });
 
   imageEmbedding =
     results.image_embed ||
@@ -56,6 +58,7 @@ export async function encodeImage(imageId, url, onStatus = () => {}) {
 export function clearEncodedImage() {
   imageEmbedding = null;
   encodedImageId = null;
+  encodedEdgeMap = null;
 }
 
 export async function segment(points, box = null, options = {}) {
@@ -178,8 +181,12 @@ export async function segment(points, box = null, options = {}) {
       : { x: Math.floor(width / 2), y: Math.floor(height / 2) };
 
   binary = selectPromptComponent(binary, width, height, anchor);
-  const polygon = maskToPolygon(binary, width, height, anchor);
+  let polygon = maskToPolygon(binary, width, height, anchor);
   if (polygon.length < 3) throw new Error("SAM2で有効な輪郭を取得できませんでした。");
+
+  if (encodedEdgeMap && options.edgeSnap !== false) {
+    polygon = snapPolygonToEdges(polygon, width, height, encodedEdgeMap);
+  }
 
   return {
     width,
@@ -198,7 +205,7 @@ async function loadImage(url) {
   });
 }
 
-function imageToTensor(image) {
+function imageToTensorAndEdges(image) {
   const canvas = document.createElement("canvas");
   canvas.width = INPUT_SIZE;
   canvas.height = INPUT_SIZE;
@@ -207,14 +214,42 @@ function imageToTensor(image) {
   const rgba = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
   const plane = INPUT_SIZE * INPUT_SIZE;
   const data = new Float32Array(3 * plane);
+  const gray = new Float32Array(plane);
 
   for (let i = 0; i < plane; i++) {
-    data[i] = (rgba[i * 4] / 255) * 2 - 1;
-    data[plane + i] = (rgba[i * 4 + 1] / 255) * 2 - 1;
-    data[plane * 2 + i] = (rgba[i * 4 + 2] / 255) * 2 - 1;
+    const r = rgba[i * 4];
+    const g = rgba[i * 4 + 1];
+    const b = rgba[i * 4 + 2];
+    data[i] = (r / 255) * 2 - 1;
+    data[plane + i] = (g / 255) * 2 - 1;
+    data[plane * 2 + i] = (b / 255) * 2 - 1;
+    gray[i] = 0.299 * r + 0.587 * g + 0.114 * b;
   }
-  return new ort.Tensor("float32", data, [1, 3, INPUT_SIZE, INPUT_SIZE]);
+
+  const edgeMap = sobelMagnitude(gray, INPUT_SIZE, INPUT_SIZE);
+  return {
+    tensor: new ort.Tensor("float32", data, [1, 3, INPUT_SIZE, INPUT_SIZE]),
+    edgeMap,
+  };
 }
+
+function sobelMagnitude(gray, width, height) {
+  const out = new Float32Array(width * height);
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const i = y * width + x;
+      const tl = gray[i - width - 1], tc = gray[i - width], tr = gray[i - width + 1];
+      const ml = gray[i - 1], mr = gray[i + 1];
+      const bl = gray[i + width - 1], bc = gray[i + width], br = gray[i + width + 1];
+
+      const gx = -tl - 2 * ml - bl + tr + 2 * mr + br;
+      const gy = -tl - 2 * tc - tr + bl + 2 * bc + br;
+      out[i] = Math.hypot(gx, gy);
+    }
+  }
+  return out;
+}
+
 
 function selectPromptComponent(binary, width, height, anchor) {
   const visited = new Uint8Array(binary.length);
@@ -293,6 +328,96 @@ function maskToPolygon(binary, width, height, anchor) {
     points = points.filter((_, i) => i % step === 0);
   }
   return points;
+}
+
+function snapPolygonToEdges(points, maskWidth, maskHeight, edgeMap) {
+  if (!points || points.length < 6) return points;
+
+  const sx = INPUT_SIZE / maskWidth;
+  const sy = INPUT_SIZE / maskHeight;
+  const radius = 9;
+  const snapped = new Array(points.length);
+
+  for (let i = 0; i < points.length; i++) {
+    const prev = points[(i - 1 + points.length) % points.length];
+    const cur = points[i];
+    const next = points[(i + 1) % points.length];
+
+    const tx = (next.x - prev.x) * sx;
+    const ty = (next.y - prev.y) * sy;
+    const len = Math.hypot(tx, ty);
+    if (len < 1e-6) {
+      snapped[i] = { ...cur };
+      continue;
+    }
+
+    // Unit normal of the contour.
+    const nx = -ty / len;
+    const ny = tx / len;
+
+    const cx = cur.x * sx;
+    const cy = cur.y * sy;
+
+    let bestX = cx;
+    let bestY = cy;
+    let bestScore = sampleEdge(edgeMap, cx, cy);
+
+    for (let d = -radius; d <= radius; d += 0.75) {
+      const x = cx + nx * d;
+      const y = cy + ny * d;
+      if (x < 1 || y < 1 || x >= INPUT_SIZE - 1 || y >= INPUT_SIZE - 1) continue;
+
+      const edge = sampleEdge(edgeMap, x, y);
+      // Prefer strong edges, but penalize large jumps away from the SAM boundary.
+      const score = edge - 7.0 * Math.abs(d);
+      if (score > bestScore) {
+        bestScore = score;
+        bestX = x;
+        bestY = y;
+      }
+    }
+
+    snapped[i] = {
+      x: bestX / sx,
+      y: bestY / sy,
+    };
+  }
+
+  // Gentle cyclic smoothing to suppress one-pixel zig-zags without undoing edge snapping.
+  return smoothClosedPolygon(snapped, 2);
+}
+
+function sampleEdge(edgeMap, x, y) {
+  const x0 = Math.floor(x), y0 = Math.floor(y);
+  const x1 = Math.min(INPUT_SIZE - 1, x0 + 1);
+  const y1 = Math.min(INPUT_SIZE - 1, y0 + 1);
+  const fx = x - x0, fy = y - y0;
+
+  const a = edgeMap[y0 * INPUT_SIZE + x0];
+  const b = edgeMap[y0 * INPUT_SIZE + x1];
+  const c = edgeMap[y1 * INPUT_SIZE + x0];
+  const d = edgeMap[y1 * INPUT_SIZE + x1];
+
+  return (a * (1 - fx) + b * fx) * (1 - fy) +
+         (c * (1 - fx) + d * fx) * fy;
+}
+
+function smoothClosedPolygon(points, passes = 1) {
+  let out = points.map((p) => ({ ...p }));
+  for (let pass = 0; pass < passes; pass++) {
+    const next = new Array(out.length);
+    for (let i = 0; i < out.length; i++) {
+      const a = out[(i - 1 + out.length) % out.length];
+      const b = out[i];
+      const c = out[(i + 1) % out.length];
+      next[i] = {
+        x: a.x * 0.18 + b.x * 0.64 + c.x * 0.18,
+        y: a.y * 0.18 + b.y * 0.64 + c.y * 0.18,
+      };
+    }
+    out = next;
+  }
+  return out;
 }
 
 function pointInRing(p, ring) {
