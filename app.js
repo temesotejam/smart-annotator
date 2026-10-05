@@ -371,10 +371,6 @@ async function handleAIBox(box){
   const ready=await prepareAIForCurrent(); if(!ready)return;
 
   const cx=box.x+box.w/2, cy=box.y+box.h/2;
-  aiPoints=[{x:cx/im.width,y:cy/im.height,label:1}];
-  aiClearBtn.disabled=false;
-  draw();
-
   const normBox={
     x1:box.x/im.width,
     y1:box.y/im.height,
@@ -382,9 +378,34 @@ async function handleAIBox(box){
     y2:(box.y+box.h)/im.height
   };
 
+  // Positive seed in the object, plus automatic negative seeds near the
+  // inner border of the requested ROI. The lower edge gets extra negatives
+  // because thin supports/legs are a common false-positive in these frames.
+  const positives=[
+    {x:cx/im.width,y:cy/im.height,label:1},
+    {x:(box.x+box.w*0.42)/im.width,y:(box.y+box.h*0.45)/im.height,label:1},
+    {x:(box.x+box.w*0.58)/im.width,y:(box.y+box.h*0.45)/im.height,label:1}
+  ];
+  const negatives=[
+    {x:(box.x+box.w*0.05)/im.width,y:(box.y+box.h*0.20)/im.height,label:0},
+    {x:(box.x+box.w*0.95)/im.width,y:(box.y+box.h*0.20)/im.height,label:0},
+    {x:(box.x+box.w*0.05)/im.width,y:(box.y+box.h*0.75)/im.height,label:0},
+    {x:(box.x+box.w*0.95)/im.width,y:(box.y+box.h*0.75)/im.height,label:0},
+    {x:(box.x+box.w*0.22)/im.width,y:(box.y+box.h*0.94)/im.height,label:0},
+    {x:(box.x+box.w*0.50)/im.width,y:(box.y+box.h*0.94)/im.height,label:0},
+    {x:(box.x+box.w*0.78)/im.width,y:(box.y+box.h*0.94)/im.height,label:0}
+  ];
+  aiPoints=[...positives,...negatives].map(p=>({
+    x:Math.max(0,Math.min(1,p.x)),
+    y:Math.max(0,Math.min(1,p.y)),
+    label:p.label
+  }));
+  aiClearBtn.disabled=false;
+  draw();
+
   try{
     aiBusy=true;
-    setAIState("busy","矩形範囲から高精度輪郭を計算しています…");
+    setAIState("busy","SAMで候補生成 → GrabCutで境界を再分離しています…");
     const result=await segment(aiPoints,normBox);
     aiCandidate={...result,promptBox:normBox};
     aiAcceptBtn.disabled=false;
@@ -418,8 +439,9 @@ async function handleAIPoint(e,p){
   try{
     aiBusy=true;
     setAIState("busy","輪郭を計算しています…");
-    const result=await segment(aiPoints,followBox);
-    aiCandidate={...result,promptBox:followBox};
+    const promptBox=aiCandidate?.promptBox||null;
+    const result=await segment(aiPoints,promptBox);
+    aiCandidate={...result,promptBox};
     aiAcceptBtn.disabled=false;
     setAIState("ready","候補生成完了（score "+result.score.toFixed(2)+"）。Enterまたは「AI確定」で採用できます。");
     draw();
@@ -554,8 +576,8 @@ async function followToNextImage(prompt,classId){
   try{
     aiBusy=true;
     setAIState("busy","前フレームの輪郭周辺に探索範囲を絞って追従しています…");
-    const result=await segment(aiPoints);
-    aiCandidate=result;
+    const result=await segment(aiPoints,followBox);
+    aiCandidate={...result,promptBox:followBox};
     aiAcceptBtn.disabled=false;
     followStatus.className="follow-status on";
     followStatus.textContent="追従候補あり：Enterで確定、クリックで補正";
