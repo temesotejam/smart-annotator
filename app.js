@@ -43,78 +43,7 @@ function restoreHistory(){
   const s=history.pop(); if(!s)return;
   const snapshot=JSON.parse(s);
   for(const item of snapshot){const im=images.find(x=>x.id===item.id);if(im)im.annotations=item.annotations}
-  selectedId=null; async function setAIState(kind,message){
-  aiBadge.className="ai-badge"+(kind?" "+kind:"");
-  aiBadge.textContent=kind==="ready"?"準備完了":kind==="busy"?"処理中":kind==="error"?"エラー":"未読込";
-  if(message)aiStatus.textContent=message;
-}
-
-async function ensureAIModel(){
-  if(isModelLoaded()){setAIState("ready","AIモデル準備完了");return true}
-  try{
-    aiBusy=true;setAIState("busy","AIモデルを読み込んでいます…");aiLoadBtn.disabled=true;
-    await loadAI(msg=>setAIState("busy",msg));
-    setAIState("ready","AIモデル準備完了。画像を解析します。");
-    return true;
-  }catch(err){
-    console.error(err);setAIState("error",err.message||"AIモデルの読み込みに失敗しました。");return false;
-  }finally{aiBusy=false;aiLoadBtn.disabled=false}
-}
-
-async function prepareAIForCurrent(){
-  const im=current();if(!im||aiBusy)return false;
-  if(aiPreparedImageId===im.id){setAIState("ready","対象を左クリックしてください。右クリックで除外点を追加できます。");return true}
-  const ok=await ensureAIModel();if(!ok)return false;
-  try{
-    aiBusy=true;setAIState("busy","この画像をAI用に解析しています…");
-    await encodeImage(im.id,im.url,msg=>setAIState("busy",msg));
-    aiPreparedImageId=im.id;
-    setAIState("ready","対象を左クリックしてください。右クリックで除外点を追加できます。");
-    return true;
-  }catch(err){
-    console.error(err);setAIState("error",err.message||"画像のAI解析に失敗しました。");return false;
-  }finally{aiBusy=false}
-}
-
-async function handleAIPoint(e,p){
-  if(aiBusy)return;
-  const im=current();if(!im)return;
-  const ready=await prepareAIForCurrent();if(!ready)return;
-  const label=e.button===2?0:1;
-  if(e.button!==0&&e.button!==2)return;
-  aiPoints.push({x:p.x/im.width,y:p.y/im.height,label});
-  aiClearBtn.disabled=false;draw();
-  try{
-    aiBusy=true;setAIState("busy","輪郭を計算しています…");
-    const result=await segment(aiPoints);
-    aiCandidate=result;
-    aiAcceptBtn.disabled=false;
-    setAIState("ready","候補生成完了（score "+result.score.toFixed(2)+"）。Enterまたは「AI確定」で採用できます。");
-    draw();
-  }catch(err){
-    console.error(err);setAIState("error",err.message||"輪郭生成に失敗しました。");
-  }finally{aiBusy=false}
-}
-
-function acceptAICandidate(){
-  if(!aiCandidate?.polygon?.length||!current())return;
-  pushHistory();
-  const a={id:uid(),type:"polygon",classId:activeClassId,points:aiCandidate.polygon.map(p=>({x:p.x,y:p.y})),preview:false,source:"ai"};
-  current().annotations.push(a);selectedId=a.id;
-  clearAICandidate(false);renderAll();
-  setAIState("ready","AI輪郭を追加しました。次の対象をクリックできます。");
-}
-
-function clearAICandidate(redraw=true){
-  aiPoints=[];aiCandidate=null;aiAcceptBtn.disabled=true;aiClearBtn.disabled=true;
-  if(redraw)draw();
-}
-
-aiLoadBtn.onclick=async()=>{await ensureAIModel();if(current())await prepareAIForCurrent()};
-aiAcceptBtn.onclick=acceptAICandidate;
-aiClearBtn.onclick=()=>{clearAICandidate();setAIState(isModelLoaded()?"ready":"","候補をクリアしました。")};
-
-renderAll();
+  selectedId=null; renderAll();
 }
 function resizeCanvas(){
   const r=stageWrap.getBoundingClientRect();
@@ -373,4 +302,125 @@ document.getElementById("exportYoloBtn").onclick=async()=>{
   });
   const blob=await zip.generateAsync({type:"blob"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="yolo-labels.zip";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
 };
+
+async function setAIState(kind,message){
+  aiBadge.className="ai-badge"+(kind?" "+kind:"");
+  aiBadge.textContent=kind==="ready"?"準備完了":kind==="busy"?"処理中":kind==="error"?"エラー":"未読込";
+  if(message)aiStatus.textContent=message;
+}
+
+async function ensureAIModel(){
+  if(isModelLoaded()){setAIState("ready","AIモデル準備完了");return true}
+  try{
+    aiBusy=true;
+    setAIState("busy","AIモデルを読み込んでいます…");
+    aiLoadBtn.disabled=true;
+    await loadAI(msg=>setAIState("busy",msg));
+    setAIState("ready","AIモデル準備完了。画像を解析します。");
+    return true;
+  }catch(err){
+    console.error(err);
+    setAIState("error",err.message||"AIモデルの読み込みに失敗しました。");
+    return false;
+  }finally{
+    aiBusy=false;
+    aiLoadBtn.disabled=false;
+  }
+}
+
+async function prepareAIForCurrent(){
+  const im=current();
+  if(!im)return false;
+  if(aiBusy)return false;
+  if(aiPreparedImageId===im.id){
+    setAIState("ready","対象を左クリックしてください。右クリックで除外点を追加できます。");
+    return true;
+  }
+  const ok=await ensureAIModel();
+  if(!ok)return false;
+  try{
+    aiBusy=true;
+    setAIState("busy","この画像をAI用に解析しています…");
+    await encodeImage(im.id,im.url,msg=>setAIState("busy",msg));
+    aiPreparedImageId=im.id;
+    setAIState("ready","対象を左クリックしてください。右クリックで除外点を追加できます。");
+    return true;
+  }catch(err){
+    console.error(err);
+    setAIState("error",err.message||"画像のAI解析に失敗しました。");
+    return false;
+  }finally{
+    aiBusy=false;
+  }
+}
+
+async function handleAIPoint(e,p){
+  if(aiBusy)return;
+  const im=current();
+  if(!im)return;
+  if(e.button!==0&&e.button!==2)return;
+
+  const ready=await prepareAIForCurrent();
+  if(!ready)return;
+
+  aiPoints.push({
+    x:p.x/im.width,
+    y:p.y/im.height,
+    label:e.button===2?0:1
+  });
+  aiClearBtn.disabled=false;
+  draw();
+
+  try{
+    aiBusy=true;
+    setAIState("busy","輪郭を計算しています…");
+    const result=await segment(aiPoints);
+    aiCandidate=result;
+    aiAcceptBtn.disabled=false;
+    setAIState("ready","候補生成完了（score "+result.score.toFixed(2)+"）。Enterまたは「AI確定」で採用できます。");
+    draw();
+  }catch(err){
+    console.error(err);
+    setAIState("error",err.message||"輪郭生成に失敗しました。");
+  }finally{
+    aiBusy=false;
+  }
+}
+
+function acceptAICandidate(){
+  if(!aiCandidate?.polygon?.length||!current())return;
+  pushHistory();
+  const a={
+    id:uid(),
+    type:"polygon",
+    classId:activeClassId,
+    points:aiCandidate.polygon.map(p=>({x:p.x,y:p.y})),
+    preview:false,
+    source:"ai"
+  };
+  current().annotations.push(a);
+  selectedId=a.id;
+  clearAICandidate(false);
+  renderAll();
+  setAIState("ready","AI輪郭を追加しました。次の対象をクリックできます。");
+}
+
+function clearAICandidate(redraw=true){
+  aiPoints=[];
+  aiCandidate=null;
+  aiAcceptBtn.disabled=true;
+  aiClearBtn.disabled=true;
+  if(redraw)draw();
+}
+
+aiLoadBtn.onclick=async()=>{
+  await ensureAIModel();
+  if(current())await prepareAIForCurrent();
+};
+aiAcceptBtn.onclick=acceptAICandidate;
+aiClearBtn.onclick=()=>{
+  clearAICandidate();
+  setAIState(isModelLoaded()?"ready":"","候補をクリアしました。");
+};
+
 renderAll();
