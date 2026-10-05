@@ -12,6 +12,7 @@ let processor = null;
 let imageProcessed = null;
 let imageEmbeddings = null;
 let encodedImageId = null;
+let encodedRawImage = null;
 
 export function isModelLoaded() {
   return !!model && !!processor;
@@ -38,6 +39,7 @@ export async function encodeImage(imageId, url, onStatus = () => {}) {
 
   onStatus("この画像をAI用に解析しています…");
   const input = await RawImage.fromURL(url);
+  encodedRawImage = input;
   imageProcessed = await processor(input);
   imageEmbeddings = await model.get_image_embeddings(imageProcessed);
   encodedImageId = imageId;
@@ -48,6 +50,7 @@ export function clearEncodedImage() {
   imageProcessed = null;
   imageEmbeddings = null;
   encodedImageId = null;
+  encodedRawImage = null;
 }
 
 export async function segment(points, box = null) {
@@ -144,6 +147,24 @@ export async function segment(points, box = null) {
   binary = removeTinyIslands(binary, rawMask.width, rawMask.height, Math.max(12, Math.floor(rawMask.width * rawMask.height * 0.00001)));
   binary = morphClose3(binary, rawMask.width, rawMask.height);
 
+  // Refine SAM's coarse mask against the actual image colors/edges.
+  // If OpenCV.js has not finished loading, keep the SAM result as a fallback.
+  if (box && encodedRawImage) {
+    try {
+      binary = await refineWithGrabCut(
+        binary,
+        rawMask.width,
+        rawMask.height,
+        points,
+        box,
+        encodedRawImage,
+      );
+      binary = selectPromptComponent(binary, rawMask.width, rawMask.height, anchor);
+    } catch (err) {
+      console.warn("GrabCut refinement skipped:", err);
+    }
+  }
+
   const polygon = maskToPolygon(binary, rawMask.width, rawMask.height, anchor);
   if (polygon.length < 3) throw new Error("輪郭を取り出せませんでした。別の点をクリックしてください。");
 
@@ -155,6 +176,92 @@ export async function segment(points, box = null) {
   };
 }
 
+
+
+async function waitForOpenCV(timeoutMs = 12000) {
+  const start = performance.now();
+  while (performance.now() - start < timeoutMs) {
+    const cv = globalThis.cv;
+    if (cv && cv.Mat && cv.grabCut) return cv;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error("OpenCV.jsの初期化が間に合いませんでした");
+}
+
+async function refineWithGrabCut(binary, width, height, points, box, rawImage) {
+  const cv = await waitForOpenCV();
+
+  // RawImage is RGB. Build an OpenCV CV_8UC3 image directly.
+  const src = new cv.Mat(height, width, cv.CV_8UC3);
+  const srcData = src.data;
+  const raw = rawImage.data;
+  if (rawImage.width !== width || rawImage.height !== height) {
+    src.delete();
+    throw new Error("GrabCut input size mismatch");
+  }
+  srcData.set(raw);
+
+  const mask = new cv.Mat(height, width, cv.CV_8UC1);
+  const md = mask.data;
+
+  const bx1 = Math.max(0, Math.min(width - 1, Math.floor(box.x1 * width)));
+  const by1 = Math.max(0, Math.min(height - 1, Math.floor(box.y1 * height)));
+  const bx2 = Math.max(bx1 + 1, Math.min(width, Math.ceil(box.x2 * width)));
+  const by2 = Math.max(by1 + 1, Math.min(height, Math.ceil(box.y2 * height)));
+
+  // 0 = sure BG, 1 = sure FG, 2 = probable BG, 3 = probable FG.
+  md.fill(0);
+  for (let y = by1; y < by2; y++) {
+    for (let x = bx1; x < bx2; x++) {
+      const i = y * width + x;
+      md[i] = binary[i] ? 3 : 2;
+    }
+  }
+
+  const paintDisk = (nx, ny, radius, label) => {
+    const cx = Math.round(nx * (width - 1));
+    const cy = Math.round(ny * (height - 1));
+    const r2 = radius * radius;
+    for (let y = Math.max(0, cy - radius); y <= Math.min(height - 1, cy + radius); y++) {
+      for (let x = Math.max(0, cx - radius); x <= Math.min(width - 1, cx + radius); x++) {
+        if ((x - cx) ** 2 + (y - cy) ** 2 <= r2) md[y * width + x] = label;
+      }
+    }
+  };
+
+  const radius = Math.max(2, Math.round(Math.min(width, height) * 0.004));
+  for (const p of points) {
+    paintDisk(p.x, p.y, radius, p.label === 1 ? 1 : 0);
+  }
+
+  // Strong background band near the bottom of the user box. This specifically
+  // suppresses thin chair/table legs accidentally connected to the object.
+  const bottomBand = Math.max(2, Math.round((by2 - by1) * 0.04));
+  for (let y = Math.max(by1, by2 - bottomBand); y < by2; y++) {
+    for (let x = bx1; x < bx2; x++) {
+      if (md[y * width + x] !== 1) md[y * width + x] = 0;
+    }
+  }
+
+  const bgdModel = new cv.Mat();
+  const fgdModel = new cv.Mat();
+  const rect = new cv.Rect(bx1, by1, Math.max(1, bx2 - bx1), Math.max(1, by2 - by1));
+
+  try {
+    cv.grabCut(src, mask, rect, bgdModel, fgdModel, 4, cv.GC_INIT_WITH_MASK);
+    const out = new Uint8Array(width * height);
+    for (let i = 0; i < out.length; i++) {
+      const v = md[i];
+      out[i] = (v === 1 || v === 3) ? 1 : 0;
+    }
+    return out;
+  } finally {
+    src.delete();
+    mask.delete();
+    bgdModel.delete();
+    fgdModel.delete();
+  }
+}
 
 function selectPromptComponent(binary, width, height, anchor) {
   const total = width * height;
