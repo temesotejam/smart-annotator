@@ -90,7 +90,7 @@
           <span>確定後、次の画像を自動追従</span>
         </label>
         <div id="followStatus" class="follow-status">追従OFF</div>
-        <p class="ai-note">AI矩形では対象周辺を切り出し、SAM2のbox promptで解析します。画像は外部サーバーへ送信せず、端末内で処理します。</p>
+        <p class="ai-note">AI矩形では対象周辺を切り出し、SAM2で領域推定した後、元画像のエッジへ輪郭を吸着させます。画像は外部サーバーへ送信しません。</p>
       </section>
     </aside>
   </main>
