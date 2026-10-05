@@ -6,7 +6,7 @@ import {
 } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.0";
 import { contours as d3Contours } from "https://cdn.jsdelivr.net/npm/d3-contour@4/+esm";
 
-const MODEL_ID = "Xenova/slimsam-77-uniform";
+const MODEL_ID = "Xenova/sam-vit-base";
 let model = null;
 let processor = null;
 let imageProcessed = null;
@@ -23,7 +23,7 @@ export async function loadAI(onStatus = () => {}) {
     throw new Error("WebGPUが利用できません。最新版のChromeまたはEdgeで開いてください。");
   }
 
-  onStatus("SlimSAMモデルを読み込んでいます…");
+  onStatus("高精度SAM ViT-Bモデルを読み込んでいます…（初回は大きめのダウンロードがあります）");
   model = await SamModel.from_pretrained(MODEL_ID, {
     dtype: "fp16",
     device: "webgpu",
@@ -88,7 +88,12 @@ export async function segment(points) {
     binary[i] = rawMask.data[nMasks * i + best] === 1 ? 1 : 0;
   }
 
-  const polygon = maskToPolygon(binary, rawMask.width, rawMask.height);
+  const positive = points.find((p) => p.label === 1) || points[0];
+  const anchor = {
+    x: positive.x * rawMask.width,
+    y: positive.y * rawMask.height,
+  };
+  const polygon = maskToPolygon(binary, rawMask.width, rawMask.height, anchor);
   if (polygon.length < 3) throw new Error("輪郭を取り出せませんでした。別の点をクリックしてください。");
 
   return {
@@ -99,7 +104,7 @@ export async function segment(points) {
   };
 }
 
-function maskToPolygon(binary, width, height) {
+function maskToPolygon(binary, width, height, anchor = null) {
   const values = Float32Array.from(binary);
   const geo = d3Contours()
     .size([width, height])
@@ -107,30 +112,49 @@ function maskToPolygon(binary, width, height) {
 
   if (!geo?.coordinates?.length) return [];
 
-  let bestRing = null;
-  let bestArea = -1;
+  const rings = [];
   for (const polygon of geo.coordinates) {
     const ring = polygon?.[0];
     if (!ring || ring.length < 4) continue;
-    const area = Math.abs(signedArea(ring));
-    if (area > bestArea) {
-      bestArea = area;
-      bestRing = ring;
-    }
+    rings.push({
+      ring,
+      area: Math.abs(signedArea(ring)),
+      containsAnchor: anchor ? pointInRing(anchor, ring) : false,
+    });
   }
-  if (!bestRing) return [];
+  if (!rings.length) return [];
 
-  // D3 contour coordinates are on pixel boundaries. Remove duplicate closing point.
-  let points = bestRing.slice(0, -1).map(([x, y]) => ({ x, y }));
-  const epsilon = Math.max(1.5, Math.min(width, height) * 0.0025);
+  // Most important: use the contour that contains the user's positive prompt.
+  // Fall back to the largest component only if no component contains it.
+  const candidates = anchor ? rings.filter((r) => r.containsAnchor) : [];
+  const chosen = (candidates.length ? candidates : rings)
+    .sort((a, b) => b.area - a.area)[0];
+
+  let points = chosen.ring.slice(0, -1).map(([x, y]) => ({ x, y }));
+
+  // Keep substantially more contour detail than before.
+  const epsilon = Math.max(0.7, Math.min(width, height) * 0.001);
   points = simplifyClosed(points, epsilon);
 
-  // Keep exports manageable while preserving the outline.
-  if (points.length > 300) {
-    const step = Math.ceil(points.length / 300);
+  // High-detail cap: enough for accurate boundaries while keeping JSON manageable.
+  if (points.length > 700) {
+    const step = Math.ceil(points.length / 700);
     points = points.filter((_, i) => i % step === 0);
   }
   return points;
+}
+
+function pointInRing(p, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1];
+    const xj = ring[j][0], yj = ring[j][1];
+    const intersect =
+      ((yi > p.y) !== (yj > p.y)) &&
+      (p.x < ((xj - xi) * (p.y - yi)) / ((yj - yi) || 1e-12) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
 }
 
 function signedArea(points) {
