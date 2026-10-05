@@ -33,7 +33,8 @@
         <button class="tool active" data-tool="box">矩形</button>
         <button class="tool" data-tool="polygon">ポリゴン</button>
         <button class="tool" data-tool="select">選択</button>
-        <button class="tool ai-tool" data-tool="ai">✨ AI選択</button>
+        <button class="tool ai-tool" data-tool="ai">✨ AI点</button>
+        <button class="tool ai-tool" data-tool="aibox">▣ AI矩形</button>
         <span class="spacer"></span>
         <button id="undoBtn" class="btn small">Undo</button>
         <button id="deleteBtn" class="btn small danger">削除</button>
@@ -75,8 +76,8 @@
         </div>
         <p id="aiStatus" class="ai-status">「AI選択」を押すと高精度SAMモデルを読み込みます。初回はモデル取得に時間がかかる場合があります。</p>
         <div class="ai-help">
-          左クリック：対象点を追加<br>
-          右クリック：除外点を追加<br>
+          <b>おすすめ：AI矩形</b>で対象をざっくり囲む<br>
+          AI点：左クリックで対象点 / 右クリックで除外点<br>
           Enter：候補を確定 / Esc：候補をクリア
         </div>
         <div class="ai-actions">
