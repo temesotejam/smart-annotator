@@ -50,7 +50,7 @@ export function clearEncodedImage() {
   encodedImageId = null;
 }
 
-export async function segment(points) {
+export async function segment(points, box = null) {
   if (!imageEmbeddings || !imageProcessed) {
     throw new Error("画像のAI解析がまだ完了していません。");
   }
@@ -65,11 +65,21 @@ export async function segment(points) {
   const input_points = new Tensor("float32", pointData, [1, 1, points.length, 2]);
   const input_labels = new Tensor("int64", labels, [1, 1, points.length]);
 
-  const { pred_masks, iou_scores } = await model({
+  const modelInputs = {
     ...imageEmbeddings,
     input_points,
     input_labels,
-  });
+  };
+
+  if (box) {
+    const x1 = Math.max(0, Math.min(1, box.x1)) * reshaped[1];
+    const y1 = Math.max(0, Math.min(1, box.y1)) * reshaped[0];
+    const x2 = Math.max(0, Math.min(1, box.x2)) * reshaped[1];
+    const y2 = Math.max(0, Math.min(1, box.y2)) * reshaped[0];
+    modelInputs.input_boxes = new Tensor("float32", [x1, y1, x2, y2], [1, 1, 4]);
+  }
+
+  const { pred_masks, iou_scores } = await model(modelInputs);
 
   const masks = await processor.post_process_masks(
     pred_masks,
@@ -79,10 +89,42 @@ export async function segment(points) {
 
   const rawMask = RawImage.fromTensor(masks[0][0]);
   const scores = Array.from(iou_scores.data);
-  let best = 0;
-  for (let i = 1; i < scores.length; i++) if (scores[i] > scores[best]) best = i;
-
   const nMasks = scores.length;
+
+  // Choose the candidate that best obeys the user's prompts, not only SAM's IoU score.
+  let best = 0;
+  let bestQuality = -Infinity;
+  for (let m = 0; m < nMasks; m++) {
+    let correct = 0;
+    for (const p of points) {
+      const px = Math.max(0, Math.min(rawMask.width - 1, Math.round(p.x * (rawMask.width - 1))));
+      const py = Math.max(0, Math.min(rawMask.height - 1, Math.round(p.y * (rawMask.height - 1))));
+      const inside = rawMask.data[nMasks * (py * rawMask.width + px) + m] === 1;
+      if ((p.label === 1 && inside) || (p.label === 0 && !inside)) correct++;
+    }
+    const promptFit = points.length ? correct / points.length : 0;
+
+    let outsideRatio = 0;
+    if (box) {
+      const bx1 = Math.floor(Math.max(0, Math.min(1, box.x1)) * rawMask.width);
+      const by1 = Math.floor(Math.max(0, Math.min(1, box.y1)) * rawMask.height);
+      const bx2 = Math.ceil(Math.max(0, Math.min(1, box.x2)) * rawMask.width);
+      const by2 = Math.ceil(Math.max(0, Math.min(1, box.y2)) * rawMask.height);
+      let total = 0, outside = 0;
+      for (let y = 0; y < rawMask.height; y += 2) {
+        for (let x = 0; x < rawMask.width; x += 2) {
+          if (rawMask.data[nMasks * (y * rawMask.width + x) + m] !== 1) continue;
+          total++;
+          if (x < bx1 || x > bx2 || y < by1 || y > by2) outside++;
+        }
+      }
+      outsideRatio = total ? outside / total : 1;
+    }
+
+    const quality = scores[m] + 0.30 * promptFit - 0.45 * outsideRatio;
+    if (quality > bestQuality) { bestQuality = quality; best = m; }
+  }
+
   const binary = new Uint8Array(rawMask.width * rawMask.height);
   for (let i = 0; i < binary.length; i++) {
     binary[i] = rawMask.data[nMasks * i + best] === 1 ? 1 : 0;
