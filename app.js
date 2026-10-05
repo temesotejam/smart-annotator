@@ -418,8 +418,8 @@ async function handleAIPoint(e,p){
   try{
     aiBusy=true;
     setAIState("busy","輪郭を計算しています…");
-    const result=await segment(aiPoints);
-    aiCandidate=result;
+    const result=await segment(aiPoints,followBox);
+    aiCandidate={...result,promptBox:followBox};
     aiAcceptBtn.disabled=false;
     setAIState("ready","候補生成完了（score "+result.score.toFixed(2)+"）。Enterまたは「AI確定」で採用できます。");
     draw();
@@ -444,7 +444,7 @@ async function acceptAICandidate(){
     preview:false,
     source:"ai"
   };
-  const followSeeds=buildFollowSeeds(a.points,im);
+  const followPrompt=buildFollowPrompt(a.points,im);
   const followClassId=a.classId;
 
   im.annotations.push(a);
@@ -454,7 +454,7 @@ async function acceptAICandidate(){
 
   if(autoFollowToggle.checked && currentIndex < images.length-1){
     setAIState("ready","AI輪郭を追加しました。次フレームを自動追従します。");
-    await followToNextImage(followSeeds,followClassId);
+    await followToNextImage(followPrompt,followClassId);
   }else{
     if(autoFollowToggle.checked && currentIndex>=images.length-1){
       followStatus.className="follow-status on";
@@ -465,8 +465,9 @@ async function acceptAICandidate(){
 }
 
 
-function buildFollowSeeds(points,im){
-  if(!points?.length||!im)return [];
+function buildFollowPrompt(points,im){
+  if(!points?.length||!im)return {seeds:[],box:null};
+
   const xs=points.map(p=>p.x), ys=points.map(p=>p.y);
   const minX=Math.min(...xs), maxX=Math.max(...xs);
   const minY=Math.min(...ys), maxY=Math.max(...ys);
@@ -475,9 +476,9 @@ function buildFollowSeeds(points,im){
   let center={x:(minX+maxX)/2,y:(minY+maxY)/2};
   if(!pointInPolygon(center,points)){
     let best=null,bestD=Infinity;
-    for(let gy=1;gy<=7;gy++){
-      for(let gx=1;gx<=7;gx++){
-        const p={x:minX+bw*gx/8,y:minY+bh*gy/8};
+    for(let gy=1;gy<=9;gy++){
+      for(let gx=1;gx<=9;gx++){
+        const p={x:minX+bw*gx/10,y:minY+bh*gy/10};
         if(!pointInPolygon(p,points))continue;
         const d=(p.x-center.x)**2+(p.y-center.y)**2;
         if(d<bestD){best=p;bestD=d}
@@ -486,30 +487,47 @@ function buildFollowSeeds(points,im){
     if(best)center=best;
   }
 
+  // Multiple positive prompts near the interior of the previous mask.
   const probes=[
     center,
-    {x:center.x-bw*0.12,y:center.y},
-    {x:center.x+bw*0.12,y:center.y},
-    {x:center.x,y:center.y-bh*0.12},
-    {x:center.x,y:center.y+bh*0.12}
+    {x:center.x-bw*0.10,y:center.y},
+    {x:center.x+bw*0.10,y:center.y},
+    {x:center.x,y:center.y-bh*0.10},
+    {x:center.x,y:center.y+bh*0.10},
+    {x:center.x-bw*0.08,y:center.y-bh*0.08},
+    {x:center.x+bw*0.08,y:center.y+bh*0.08}
   ];
+
   const seeds=[];
   for(const p of probes){
     if(p.x<0||p.y<0||p.x>im.width||p.y>im.height)continue;
     if(!pointInPolygon(p,points))continue;
     const q={x:p.x/im.width,y:p.y/im.height,label:1};
-    if(!seeds.some(s=>Math.hypot(s.x-q.x,s.y-q.y)<0.008))seeds.push(q);
+    if(!seeds.some(s=>Math.hypot(s.x-q.x,s.y-q.y)<0.006))seeds.push(q);
+  }
+  if(!seeds.length){
+    seeds.push({x:center.x/im.width,y:center.y/im.height,label:1});
   }
 
-  if(!seeds.length){
-    const p=points[Math.floor(points.length/2)];
-    seeds.push({x:p.x/im.width,y:p.y/im.height,label:1});
-  }
-  return seeds.slice(0,5);
+  // Restrict the search to a padded ROI around the previous object.
+  // The padding is deliberately generous enough for inter-frame motion,
+  // while excluding most of the cluttered room background.
+  const padX=Math.max(bw*0.42, im.width*0.012);
+  const padY=Math.max(bh*0.42, im.height*0.012);
+  const box={
+    x1:Math.max(0,(minX-padX)/im.width),
+    y1:Math.max(0,(minY-padY)/im.height),
+    x2:Math.min(1,(maxX+padX)/im.width),
+    y2:Math.min(1,(maxY+padY)/im.height)
+  };
+
+  return {seeds:seeds.slice(0,7),box};
 }
 
-async function followToNextImage(seeds,classId){
-  if(!seeds?.length || currentIndex>=images.length-1)return;
+async function followToNextImage(prompt,classId){
+  const seeds=prompt?.seeds||[];
+  const followBox=prompt?.box||null;
+  if(!seeds.length || currentIndex>=images.length-1)return;
   followStatus.className="follow-status busy";
   followStatus.textContent="次の画像を追従中…";
 
@@ -535,7 +553,7 @@ async function followToNextImage(seeds,classId){
 
   try{
     aiBusy=true;
-    setAIState("busy","前フレームから追従候補を計算しています…");
+    setAIState("busy","前フレームの輪郭周辺に探索範囲を絞って追従しています…");
     const result=await segment(aiPoints);
     aiCandidate=result;
     aiAcceptBtn.disabled=false;
