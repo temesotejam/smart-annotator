@@ -1,14 +1,20 @@
 import { contours as d3Contours } from "https://cdn.jsdelivr.net/npm/d3-contour@4/+esm";
 
-const ENCODER_MODEL_URL = "https://storage.googleapis.com/lb-artifacts-testing-public/sam2/sam2_hiera_tiny.encoder.ort";
-const DECODER_MODEL_URL = "https://storage.googleapis.com/lb-artifacts-testing-public/sam2/sam2_hiera_tiny.decoder.onnx";
-const INPUT_SIZE = 1024;
+const ENCODER_MODEL_URL =
+  "https://raw.githubusercontent.com/krngd2/SamOnWeb/main/fp16.sam2_hiera_tiny.encoder.ort";
+const DECODER_MODEL_URL =
+  "https://raw.githubusercontent.com/krngd2/SamOnWeb/main/fp16.sam2_hiera_tiny.decoder.ort";
+
+const MODEL_SIZE = 1024;
 const MASK_INPUT_SIZE = 256;
 
 let encoderSession = null;
 let decoderSession = null;
-let imageEmbedding = null;
+let encoderOutputs = null;
 let encodedImageId = null;
+let encodedWidth = 0;
+let encodedHeight = 0;
+let preprocess = null;
 let encodedEdgeMap = null;
 
 export function isModelLoaded() {
@@ -19,180 +25,255 @@ export async function loadAI(onStatus = () => {}) {
   if (isModelLoaded()) return;
   if (!globalThis.ort) throw new Error("ONNX Runtime Webを読み込めませんでした。");
 
-  onStatus("SAM2 Hiera Tinyエンコーダを読み込んでいます…");
-  const providers = navigator.gpu ? ["webgpu", "wasm"] : ["wasm"];
-
-  encoderSession = await ort.InferenceSession.create(ENCODER_MODEL_URL, {
-    executionProviders: providers,
-  });
+  // This fp16 export is known to run in-browser. Avoid forcing WebGPU here:
+  // ORT will select the compatible backend for the model.
+  onStatus("互換fp16版 SAM2 Hiera Tiny エンコーダを読み込んでいます…");
+  encoderSession = await ort.InferenceSession.create(ENCODER_MODEL_URL);
 
   onStatus("SAM2デコーダを読み込んでいます…");
-  decoderSession = await ort.InferenceSession.create(DECODER_MODEL_URL, {
-    executionProviders: providers,
-  });
+  decoderSession = await ort.InferenceSession.create(DECODER_MODEL_URL);
 
   onStatus("SAM2準備完了");
 }
 
 export async function encodeImage(imageId, url, onStatus = () => {}) {
   if (!isModelLoaded()) await loadAI(onStatus);
-  if (encodedImageId === imageId && imageEmbedding) return;
+  if (encodedImageId === imageId && encoderOutputs) return;
 
   onStatus("SAM2で画像特徴を抽出しています…");
   const img = await loadImage(url);
-  const prepared = imageToTensorAndEdges(img);
+  encodedWidth = img.naturalWidth || img.width;
+  encodedHeight = img.naturalHeight || img.height;
+
+  const prepared = preprocessImage(img);
+  preprocess = prepared.transform;
   encodedEdgeMap = prepared.edgeMap;
-  const results = await encoderSession.run({ image: prepared.tensor });
 
-  imageEmbedding =
-    results.image_embed ||
-    results.image_embeddings ||
-    Object.values(results)[0];
+  encoderOutputs = await encoderSession.run({
+    image: prepared.tensor,
+  });
 
-  if (!imageEmbedding) throw new Error("SAM2エンコーダ出力を取得できませんでした。");
+  if (!encoderOutputs.image_embed) {
+    throw new Error(
+      "SAM2 encoder output image_embed が見つかりません: " +
+      Object.keys(encoderOutputs).join(", ")
+    );
+  }
 
   encodedImageId = imageId;
   onStatus("画像解析完了。対象を指定してください。");
 }
 
 export function clearEncodedImage() {
-  imageEmbedding = null;
+  encoderOutputs = null;
   encodedImageId = null;
+  encodedWidth = 0;
+  encodedHeight = 0;
+  preprocess = null;
   encodedEdgeMap = null;
 }
 
 export async function segment(points, box = null, options = {}) {
-  if (!imageEmbedding) throw new Error("画像のSAM2解析がまだ完了していません。");
+  if (!encoderOutputs || !preprocess) {
+    throw new Error("画像のSAM2解析がまだ完了していません。");
+  }
 
   const promptPoints = [];
 
-  // SAM2 represents box prompts as two points with labels 2 and 3.
   if (box) {
-    promptPoints.push({
-      x: clamp01(box.x1) * INPUT_SIZE,
-      y: clamp01(box.y1) * INPUT_SIZE,
-      label: 2,
-    });
-    promptPoints.push({
-      x: clamp01(box.x2) * INPUT_SIZE,
-      y: clamp01(box.y2) * INPUT_SIZE,
-      label: 3,
-    });
+    const p1 = normalizedToModel(box.x1, box.y1);
+    const p2 = normalizedToModel(box.x2, box.y2);
+    promptPoints.push({ x: p1.x, y: p1.y, label: 2 });
+    promptPoints.push({ x: p2.x, y: p2.y, label: 3 });
   }
 
   for (const p of points || []) {
+    const q = normalizedToModel(p.x, p.y);
     promptPoints.push({
-      x: clamp01(p.x) * INPUT_SIZE,
-      y: clamp01(p.y) * INPUT_SIZE,
+      x: q.x,
+      y: q.y,
       label: p.label === 0 ? 0 : 1,
     });
   }
 
-  if (!promptPoints.length) throw new Error("SAM2への指定点がありません。");
+  if (!promptPoints.length) {
+    throw new Error("SAM2への指定点がありません。");
+  }
 
-  const coords = new Float32Array(promptPoints.length * 2);
-  const labels = new Float32Array(promptPoints.length);
+  const coordsF32 = new Float32Array(promptPoints.length * 2);
+  const labelsF32 = new Float32Array(promptPoints.length);
   promptPoints.forEach((p, i) => {
-    coords[i * 2] = p.x;
-    coords[i * 2 + 1] = p.y;
-    labels[i] = p.label;
+    coordsF32[i * 2] = p.x;
+    coordsF32[i * 2 + 1] = p.y;
+    labelsF32[i] = p.label;
   });
 
-  const inputs = {
-    image_embed: imageEmbedding,
-    point_coords: new ort.Tensor("float32", coords, [1, promptPoints.length, 2]),
-    point_labels: new ort.Tensor("float32", labels, [1, promptPoints.length]),
-    mask_input: new ort.Tensor(
-      "float32",
-      new Float32Array(MASK_INPUT_SIZE * MASK_INPUT_SIZE),
-      [1, 1, MASK_INPUT_SIZE, MASK_INPUT_SIZE],
-    ),
-    has_mask_input: new ort.Tensor("float32", new Float32Array([0]), [1]),
-    high_res_feats_0: new ort.Tensor(
-      "float32",
-      new Float32Array(1 * 32 * 256 * 256),
-      [1, 32, 256, 256],
-    ),
-    high_res_feats_1: new ort.Tensor(
-      "float32",
-      new Float32Array(1 * 64 * 128 * 128),
-      [1, 64, 128, 128],
-    ),
+  const pointCoords = new ort.Tensor(
+    "float16",
+    float32ArrayToFloat16(coordsF32),
+    [1, promptPoints.length, 2]
+  );
+  const pointLabels = new ort.Tensor(
+    "float16",
+    float32ArrayToFloat16(labelsF32),
+    [1, promptPoints.length]
+  );
+
+  const maskInput = new ort.Tensor(
+    "float16",
+    new Uint16Array(MASK_INPUT_SIZE * MASK_INPUT_SIZE),
+    [1, 1, MASK_INPUT_SIZE, MASK_INPUT_SIZE]
+  );
+
+  const hasMaskInput = new ort.Tensor(
+    "float16",
+    float32ArrayToFloat16(new Float32Array([0])),
+    [1]
+  );
+
+  const feeds = {
+    image_embed: encoderOutputs.image_embed,
+    point_coords: pointCoords,
+    point_labels: pointLabels,
+    mask_input: maskInput,
+    has_mask_input: hasMaskInput,
   };
 
-  const results = await decoderSession.run(inputs);
-  const maskTensor =
+  if (encoderOutputs.high_res_feats_0) {
+    feeds.high_res_feats_0 = encoderOutputs.high_res_feats_0;
+  }
+  if (encoderOutputs.high_res_feats_1) {
+    feeds.high_res_feats_1 = encoderOutputs.high_res_feats_1;
+  }
+
+  const results = await decoderSession.run(feeds);
+  const masks =
     results.masks ||
     results.pred_masks ||
-    Object.values(results).find((v) => v?.dims?.length === 4);
+    Object.values(results).find((v) => v?.dims?.length >= 3);
 
-  if (!maskTensor) throw new Error("SAM2マスク出力を取得できませんでした。");
+  if (!masks) {
+    throw new Error(
+      "SAM2 mask output が見つかりません: " +
+      Object.keys(results).join(", ")
+    );
+  }
 
-  const height = maskTensor.dims[maskTensor.dims.length - 2];
-  const width = maskTensor.dims[maskTensor.dims.length - 1];
-  const plane = width * height;
-  const channels = Math.max(1, Math.floor(maskTensor.data.length / plane));
+  const dims = masks.dims;
+  const maskH = dims[dims.length - 2];
+  const maskW = dims[dims.length - 1];
+  const plane = maskW * maskH;
+  const channels = Math.max(1, Math.floor(masks.data.length / plane));
 
-  // Select the mask that best respects prompts and has a sensible size.
   let bestChannel = 0;
   let bestScore = -Infinity;
+
+  const iou =
+    results.iou_predictions ||
+    results.iou_scores ||
+    results.predicted_iou;
+
   for (let c = 0; c < channels; c++) {
     let correct = 0;
-    let positives = 0;
     let area = 0;
 
     for (const p of points || []) {
-      const px = Math.max(0, Math.min(width - 1, Math.round(clamp01(p.x) * (width - 1))));
-      const py = Math.max(0, Math.min(height - 1, Math.round(clamp01(p.y) * (height - 1))));
-      const inside = maskTensor.data[c * plane + py * width + px] > 0;
-      if (p.label === 1) positives++;
+      const q = normalizedToMask(p.x, p.y, maskW, maskH);
+      const idx = c * plane + q.y * maskW + q.x;
+      const inside = Number(masks.data[idx]) > 0;
       if ((p.label === 1 && inside) || (p.label === 0 && !inside)) correct++;
     }
-    for (let i = 0; i < plane; i += 4) {
-      if (maskTensor.data[c * plane + i] > 0) area++;
+
+    for (let i = 0; i < plane; i += 8) {
+      if (Number(masks.data[c * plane + i]) > 0) area++;
     }
 
-    const fit = points?.length ? correct / points.length : 0.5;
-    const areaRatio = area / Math.ceil(plane / 4);
-    const sizePenalty = areaRatio > 0.90 ? (areaRatio - 0.90) * 3 : 0;
-    const score = fit - sizePenalty + (positives ? 0.1 : 0);
+    const promptFit = points?.length ? correct / points.length : 0.5;
+    const areaRatio = area / Math.ceil(plane / 8);
+    const iouScore = iou?.data?.[c] != null ? Number(iou.data[c]) : 0;
+    const sizePenalty = areaRatio > 0.92 ? (areaRatio - 0.92) * 4 : 0;
+
+    const score = promptFit * 0.65 + iouScore * 0.35 - sizePenalty;
     if (score > bestScore) {
       bestScore = score;
       bestChannel = c;
     }
   }
 
-  let binary = new Uint8Array(plane);
-  for (let i = 0; i < plane; i++) {
-    binary[i] = maskTensor.data[bestChannel * plane + i] > 0 ? 1 : 0;
+  // Resample model mask back into the original encoded image coordinate system.
+  let binary = new Uint8Array(encodedWidth * encodedHeight);
+
+  for (let y = 0; y < encodedHeight; y++) {
+    for (let x = 0; x < encodedWidth; x++) {
+      const m = originalToMask(x, y, maskW, maskH);
+      const idx = bestChannel * plane + m.y * maskW + m.x;
+      binary[y * encodedWidth + x] = Number(masks.data[idx]) > 0 ? 1 : 0;
+    }
   }
 
   const positive = (points || []).find((p) => p.label === 1);
   const anchor = positive
     ? {
-        x: Math.round(clamp01(positive.x) * (width - 1)),
-        y: Math.round(clamp01(positive.y) * (height - 1)),
+        x: Math.round(clamp01(positive.x) * (encodedWidth - 1)),
+        y: Math.round(clamp01(positive.y) * (encodedHeight - 1)),
       }
     : box
       ? {
-          x: Math.round(((box.x1 + box.x2) / 2) * (width - 1)),
-          y: Math.round(((box.y1 + box.y2) / 2) * (height - 1)),
+          x: Math.round(((box.x1 + box.x2) / 2) * (encodedWidth - 1)),
+          y: Math.round(((box.y1 + box.y2) / 2) * (encodedHeight - 1)),
         }
-      : { x: Math.floor(width / 2), y: Math.floor(height / 2) };
+      : {
+          x: Math.floor(encodedWidth / 2),
+          y: Math.floor(encodedHeight / 2),
+        };
 
-  binary = selectPromptComponent(binary, width, height, anchor);
-  let polygon = maskToPolygon(binary, width, height, anchor);
-  if (polygon.length < 3) throw new Error("SAM2で有効な輪郭を取得できませんでした。");
+  binary = selectPromptComponent(binary, encodedWidth, encodedHeight, anchor);
+
+  let polygon = maskToPolygon(binary, encodedWidth, encodedHeight, anchor);
+  if (polygon.length < 3) {
+    throw new Error("SAM2で有効な輪郭を取得できませんでした。");
+  }
 
   if (encodedEdgeMap && options.edgeSnap !== false) {
-    polygon = snapPolygonToEdges(polygon, width, height, encodedEdgeMap);
+    polygon = snapPolygonToEdges(
+      polygon,
+      encodedWidth,
+      encodedHeight,
+      encodedEdgeMap
+    );
   }
 
   return {
-    width,
-    height,
+    width: encodedWidth,
+    height: encodedHeight,
     score: bestScore,
     polygon,
+  };
+}
+
+function normalizedToModel(nx, ny) {
+  const x = clamp01(nx) * encodedWidth;
+  const y = clamp01(ny) * encodedHeight;
+  return {
+    x: x * preprocess.scale + preprocess.offsetX,
+    y: y * preprocess.scale + preprocess.offsetY,
+  };
+}
+
+function normalizedToMask(nx, ny, maskW, maskH) {
+  const p = normalizedToModel(nx, ny);
+  return {
+    x: Math.max(0, Math.min(maskW - 1, Math.round((p.x / MODEL_SIZE) * (maskW - 1)))),
+    y: Math.max(0, Math.min(maskH - 1, Math.round((p.y / MODEL_SIZE) * (maskH - 1)))),
+  };
+}
+
+function originalToMask(x, y, maskW, maskH) {
+  const mx = x * preprocess.scale + preprocess.offsetX;
+  const my = y * preprocess.scale + preprocess.offsetY;
+  return {
+    x: Math.max(0, Math.min(maskW - 1, Math.round((mx / MODEL_SIZE) * (maskW - 1)))),
+    y: Math.max(0, Math.min(maskH - 1, Math.round((my / MODEL_SIZE) * (maskH - 1)))),
   };
 }
 
@@ -205,31 +286,57 @@ async function loadImage(url) {
   });
 }
 
-function imageToTensorAndEdges(image) {
+function preprocessImage(image) {
   const canvas = document.createElement("canvas");
-  canvas.width = INPUT_SIZE;
-  canvas.height = INPUT_SIZE;
+  canvas.width = MODEL_SIZE;
+  canvas.height = MODEL_SIZE;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  ctx.drawImage(image, 0, 0, INPUT_SIZE, INPUT_SIZE);
-  const rgba = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
-  const plane = INPUT_SIZE * INPUT_SIZE;
-  const data = new Float32Array(3 * plane);
-  const gray = new Float32Array(plane);
+
+  const width = image.naturalWidth || image.width;
+  const height = image.naturalHeight || image.height;
+  const scale = Math.min(MODEL_SIZE / width, MODEL_SIZE / height);
+  const scaledWidth = width * scale;
+  const scaledHeight = height * scale;
+  const offsetX = (MODEL_SIZE - scaledWidth) / 2;
+  const offsetY = (MODEL_SIZE - scaledHeight) / 2;
+
+  ctx.clearRect(0, 0, MODEL_SIZE, MODEL_SIZE);
+  ctx.drawImage(image, offsetX, offsetY, scaledWidth, scaledHeight);
+
+  const rgba = ctx.getImageData(0, 0, MODEL_SIZE, MODEL_SIZE).data;
+  const plane = MODEL_SIZE * MODEL_SIZE;
+  const f16 = new Uint16Array(3 * plane);
+  const gray = new Float32Array(width * height);
 
   for (let i = 0; i < plane; i++) {
     const r = rgba[i * 4];
     const g = rgba[i * 4 + 1];
     const b = rgba[i * 4 + 2];
-    data[i] = (r / 255) * 2 - 1;
-    data[plane + i] = (g / 255) * 2 - 1;
-    data[plane * 2 + i] = (b / 255) * 2 - 1;
-    gray[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+
+    f16[i] = float32ToFloat16((r / 255 - 0.485) / 0.229);
+    f16[plane + i] = float32ToFloat16((g / 255 - 0.456) / 0.224);
+    f16[plane * 2 + i] = float32ToFloat16((b / 255 - 0.406) / 0.225);
   }
 
-  const edgeMap = sobelMagnitude(gray, INPUT_SIZE, INPUT_SIZE);
+  // Build edge map in original encoded-image coordinates.
+  const originalCanvas = document.createElement("canvas");
+  originalCanvas.width = width;
+  originalCanvas.height = height;
+  const octx = originalCanvas.getContext("2d", { willReadFrequently: true });
+  octx.drawImage(image, 0, 0, width, height);
+  const org = octx.getImageData(0, 0, width, height).data;
+
+  for (let i = 0; i < width * height; i++) {
+    gray[i] =
+      0.299 * org[i * 4] +
+      0.587 * org[i * 4 + 1] +
+      0.114 * org[i * 4 + 2];
+  }
+
   return {
-    tensor: new ort.Tensor("float32", data, [1, 3, INPUT_SIZE, INPUT_SIZE]),
-    edgeMap,
+    tensor: new ort.Tensor("float16", f16, [1, 3, MODEL_SIZE, MODEL_SIZE]),
+    transform: { scale, offsetX, offsetY, scaledWidth, scaledHeight },
+    edgeMap: sobelMagnitude(gray, width, height),
   };
 }
 
@@ -250,7 +357,6 @@ function sobelMagnitude(gray, width, height) {
   return out;
 }
 
-
 function selectPromptComponent(binary, width, height, anchor) {
   const visited = new Uint8Array(binary.length);
   const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]];
@@ -258,6 +364,7 @@ function selectPromptComponent(binary, width, height, anchor) {
 
   for (let start = 0; start < binary.length; start++) {
     if (!binary[start] || visited[start]) continue;
+
     const stack = [start];
     visited[start] = 1;
     const pixels = [];
@@ -281,10 +388,12 @@ function selectPromptComponent(binary, width, height, anchor) {
         }
       }
     }
+
     components.push({ pixels, minD2 });
   }
 
   if (!components.length) return binary;
+
   components.sort((a, b) => {
     if (Math.abs(a.minD2 - b.minD2) > 1) return a.minD2 - b.minD2;
     return b.pixels.length - a.pixels.length;
@@ -313,6 +422,7 @@ function maskToPolygon(binary, width, height, anchor) {
       area: Math.abs(signedArea(ring)),
     });
   }
+
   if (!rings.length) return [];
 
   const candidates = rings.filter((r) => r.contains);
@@ -320,6 +430,7 @@ function maskToPolygon(binary, width, height, anchor) {
     .sort((a, b) => b.area - a.area)[0];
 
   let points = chosen.ring.slice(0, -1).map(([x, y]) => ({ x, y }));
+
   const epsilon = Math.max(0.2, Math.min(width, height) * 0.00025);
   points = simplifyClosed(points, epsilon);
 
@@ -327,15 +438,14 @@ function maskToPolygon(binary, width, height, anchor) {
     const step = Math.ceil(points.length / 1800);
     points = points.filter((_, i) => i % step === 0);
   }
+
   return points;
 }
 
-function snapPolygonToEdges(points, maskWidth, maskHeight, edgeMap) {
+function snapPolygonToEdges(points, width, height, edgeMap) {
   if (!points || points.length < 6) return points;
 
-  const sx = INPUT_SIZE / maskWidth;
-  const sy = INPUT_SIZE / maskHeight;
-  const radius = 9;
+  const radius = Math.max(3, Math.min(10, Math.round(Math.min(width, height) * 0.012)));
   const snapped = new Array(points.length);
 
   for (let i = 0; i < points.length; i++) {
@@ -343,60 +453,51 @@ function snapPolygonToEdges(points, maskWidth, maskHeight, edgeMap) {
     const cur = points[i];
     const next = points[(i + 1) % points.length];
 
-    const tx = (next.x - prev.x) * sx;
-    const ty = (next.y - prev.y) * sy;
+    const tx = next.x - prev.x;
+    const ty = next.y - prev.y;
     const len = Math.hypot(tx, ty);
+
     if (len < 1e-6) {
       snapped[i] = { ...cur };
       continue;
     }
 
-    // Unit normal of the contour.
     const nx = -ty / len;
     const ny = tx / len;
 
-    const cx = cur.x * sx;
-    const cy = cur.y * sy;
+    let best = { x: cur.x, y: cur.y };
+    let bestScore = sampleEdge(edgeMap, width, height, cur.x, cur.y);
 
-    let bestX = cx;
-    let bestY = cy;
-    let bestScore = sampleEdge(edgeMap, cx, cy);
+    for (let d = -radius; d <= radius; d += 0.5) {
+      const x = cur.x + nx * d;
+      const y = cur.y + ny * d;
+      if (x < 1 || y < 1 || x >= width - 1 || y >= height - 1) continue;
 
-    for (let d = -radius; d <= radius; d += 0.75) {
-      const x = cx + nx * d;
-      const y = cy + ny * d;
-      if (x < 1 || y < 1 || x >= INPUT_SIZE - 1 || y >= INPUT_SIZE - 1) continue;
+      const edge = sampleEdge(edgeMap, width, height, x, y);
+      const score = edge - 8.0 * Math.abs(d);
 
-      const edge = sampleEdge(edgeMap, x, y);
-      // Prefer strong edges, but penalize large jumps away from the SAM boundary.
-      const score = edge - 7.0 * Math.abs(d);
       if (score > bestScore) {
         bestScore = score;
-        bestX = x;
-        bestY = y;
+        best = { x, y };
       }
     }
 
-    snapped[i] = {
-      x: bestX / sx,
-      y: bestY / sy,
-    };
+    snapped[i] = best;
   }
 
-  // Gentle cyclic smoothing to suppress one-pixel zig-zags without undoing edge snapping.
-  return smoothClosedPolygon(snapped, 2);
+  return smoothClosedPolygon(snapped, 1);
 }
 
-function sampleEdge(edgeMap, x, y) {
+function sampleEdge(edgeMap, width, height, x, y) {
   const x0 = Math.floor(x), y0 = Math.floor(y);
-  const x1 = Math.min(INPUT_SIZE - 1, x0 + 1);
-  const y1 = Math.min(INPUT_SIZE - 1, y0 + 1);
+  const x1 = Math.min(width - 1, x0 + 1);
+  const y1 = Math.min(height - 1, y0 + 1);
   const fx = x - x0, fy = y - y0;
 
-  const a = edgeMap[y0 * INPUT_SIZE + x0];
-  const b = edgeMap[y0 * INPUT_SIZE + x1];
-  const c = edgeMap[y1 * INPUT_SIZE + x0];
-  const d = edgeMap[y1 * INPUT_SIZE + x1];
+  const a = edgeMap[y0 * width + x0];
+  const b = edgeMap[y0 * width + x1];
+  const c = edgeMap[y1 * width + x0];
+  const d = edgeMap[y1 * width + x1];
 
   return (a * (1 - fx) + b * fx) * (1 - fy) +
          (c * (1 - fx) + d * fx) * fy;
@@ -404,6 +505,7 @@ function sampleEdge(edgeMap, x, y) {
 
 function smoothClosedPolygon(points, passes = 1) {
   let out = points.map((p) => ({ ...p }));
+
   for (let pass = 0; pass < passes; pass++) {
     const next = new Array(out.length);
     for (let i = 0; i < out.length; i++) {
@@ -411,12 +513,13 @@ function smoothClosedPolygon(points, passes = 1) {
       const b = out[i];
       const c = out[(i + 1) % out.length];
       next[i] = {
-        x: a.x * 0.18 + b.x * 0.64 + c.x * 0.18,
-        y: a.y * 0.18 + b.y * 0.64 + c.y * 0.18,
+        x: a.x * 0.15 + b.x * 0.70 + c.x * 0.15,
+        y: a.y * 0.15 + b.y * 0.70 + c.y * 0.15,
       };
     }
     out = next;
   }
+
   return out;
 }
 
@@ -451,30 +554,83 @@ function simplifyClosed(points, epsilon) {
 
 function rdp(points, epsilon) {
   if (points.length < 3) return points.slice();
-  const first = points[0], last = points[points.length - 1];
-  let maxDist = 0, index = 0;
+
+  const first = points[0];
+  const last = points[points.length - 1];
+  let maxDist = 0;
+  let index = 0;
 
   for (let i = 1; i < points.length - 1; i++) {
     const d = pointLineDistance(points[i], first, last);
-    if (d > maxDist) { maxDist = d; index = i; }
+    if (d > maxDist) {
+      maxDist = d;
+      index = i;
+    }
   }
+
   if (maxDist > epsilon) {
     const left = rdp(points.slice(0, index + 1), epsilon);
     const right = rdp(points.slice(index), epsilon);
     return left.slice(0, -1).concat(right);
   }
+
   return [first, last];
 }
 
 function pointLineDistance(p, a, b) {
-  const dx = b.x - a.x, dy = b.y - a.y;
-  if (dx === 0 && dy === 0) return Math.hypot(p.x - a.x, p.y - a.y);
-  const t = Math.max(0, Math.min(1,
-    ((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy)
-  ));
-  return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+
+  if (dx === 0 && dy === 0) {
+    return Math.hypot(p.x - a.x, p.y - a.y);
+  }
+
+  const t = Math.max(
+    0,
+    Math.min(
+      1,
+      ((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy)
+    )
+  );
+
+  return Math.hypot(
+    p.x - (a.x + t * dx),
+    p.y - (a.y + t * dy)
+  );
 }
 
 function clamp01(v) {
   return Math.max(0, Math.min(1, v));
 }
+
+function float32ArrayToFloat16(arr) {
+  const out = new Uint16Array(arr.length);
+  for (let i = 0; i < arr.length; i++) out[i] = float32ToFloat16(arr[i]);
+  return out;
+}
+
+const float32ToFloat16 = (() => {
+  const f = new Float32Array(1);
+  const i = new Int32Array(f.buffer);
+
+  return (val) => {
+    f[0] = val;
+    const x = i[0];
+
+    const sign = (x >> 16) & 0x8000;
+    let exp = ((x >> 23) & 0xff) - 127 + 15;
+    let mant = x & 0x7fffff;
+
+    if (exp <= 0) {
+      if (exp < -10) return sign;
+      mant = (mant | 0x800000) >> (1 - exp);
+      return sign | ((mant + 0x1000) >> 13);
+    }
+
+    if (exp >= 31) {
+      return sign | 0x7c00;
+    }
+
+    return sign | (exp << 10) | ((mant + 0x1000) >> 13);
+  };
+})();
